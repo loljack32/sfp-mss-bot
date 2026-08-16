@@ -1,5 +1,5 @@
 # ============================================================
-# MAIN SCANNER PIPELINE
+# MAIN SCANNER PIPELINE (TOP 200 COINS)
 # SFP + MSS BOT
 # ============================================================
 
@@ -8,12 +8,15 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 from config import (
     SYMBOLS,
+    DYNAMIC_TOP_SYMBOLS,
+    TOP_SYMBOLS_COUNT,
     HTF_TIMEFRAME,
     ENTRY_TIMEFRAME,
     CANDLE_LIMIT,
@@ -39,10 +42,6 @@ USER_SETTINGS_FILE = "data/user_settings.json"
 
 
 def load_user_settings(filepath: str = USER_SETTINGS_FILE) -> Tuple[float, float]:
-    """
-    Загружает пользовательский баланс и процент риска из Telegram.
-    Если файла нет, возвращаются значения по умолчанию.
-    """
     path = Path(filepath)
     if not path.exists():
         return 10000.0, float(DEFAULT_RISK_PERCENT)
@@ -54,15 +53,11 @@ def load_user_settings(filepath: str = USER_SETTINGS_FILE) -> Tuple[float, float
             risk = float(data.get("risk_percent", DEFAULT_RISK_PERCENT))
             return balance, risk
     except Exception as exc:
-        print(f"[WARN] Failed to read user settings from {filepath}: {exc}")
+        print(f"[WARN] Failed to read user settings: {exc}")
         return 10000.0, float(DEFAULT_RISK_PERCENT)
 
 
 def load_signal_state(filepath: str = SIGNAL_STATE_FILE) -> Dict[str, str]:
-    """
-    Загружает историю отправленных сигналов для предотвращения дублирования.
-    Формат: { "SYMBOL_DIRECTION": "ISO_TIMESTAMP" }
-    """
     path = Path(filepath)
     if not path.exists():
         return {}
@@ -71,14 +66,11 @@ def load_signal_state(filepath: str = SIGNAL_STATE_FILE) -> Dict[str, str]:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as exc:
-        print(f"[WARN] Failed to read state file {filepath}: {exc}")
+        print(f"[WARN] Failed to read state file: {exc}")
         return {}
 
 
 def save_signal_state(state: Dict[str, str], filepath: str = SIGNAL_STATE_FILE) -> None:
-    """
-    Сохраняет состояние сигналов на диск.
-    """
     path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -86,7 +78,7 @@ def save_signal_state(state: Dict[str, str], filepath: str = SIGNAL_STATE_FILE) 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
     except Exception as exc:
-        print(f"[ERROR] Failed to save state file {filepath}: {exc}")
+        print(f"[ERROR] Failed to save state file: {exc}")
 
 
 def is_on_cooldown(
@@ -95,9 +87,6 @@ def is_on_cooldown(
     state: Dict[str, str],
     cooldown_minutes: int = SIGNAL_COOLDOWN_MINUTES,
 ) -> bool:
-    """
-    Проверяет, прошло ли достаточно времени с момента прошлого сигнала.
-    """
     key = f"{symbol}_{direction}"
     last_sent_str = state.get(key)
     if not last_sent_str:
@@ -113,43 +102,49 @@ def is_on_cooldown(
 
 
 def record_signal_sent(symbol: str, direction: str, state: Dict[str, str]) -> None:
-    """
-    Записывает время отправки сигнала.
-    """
     key = f"{symbol}_{direction}"
     state[key] = datetime.now(timezone.utc).isoformat()
 
 
 # ============================================================
-# MAIN EXECUTION
+# MAIN SCANNER LOOP
 # ============================================================
 
 def run_scanner() -> None:
-    """
-    Основной рабочий цикл сканирования инструментов по OKX API.
-    """
-    print("=" * 60)
-    print(f"Starting SFP + MSS Scanner at {datetime.now(timezone.utc).isoformat()} UTC")
-    print(f"Symbols ({len(SYMBOLS)}): {', '.join(SYMBOLS)}")
-    print(f"HTF: {HTF_TIMEFRAME} | LTF Entry: {ENTRY_TIMEFRAME}")
-    print("=" * 60)
-
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     state = load_signal_state()
     account_balance, risk_percent = load_user_settings()
-
-    print(f"[CONFIG] Active Balance: ${account_balance:,.2f} | Active Risk: {risk_percent:.2f}%")
-
     telegram = TelegramNotifier()
+
+    print("=" * 65)
+    print(f"Starting SFP + MSS Scanner at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    print(f"Account Balance: ${account_balance:,.2f} | Risk per Trade: {risk_percent:.2f}%")
+    print(f"HTF: {HTF_TIMEFRAME} | LTF: {ENTRY_TIMEFRAME}")
+    print("=" * 65)
+
     signals_found = 0
     signals_sent = 0
 
     with OKXClient() as client:
-        for symbol in SYMBOLS:
-            print(f"\n[{symbol}] Fetching market data...")
-
+        # 1. Получаем список монет для сканирования (Топ-200 или резервный список)
+        if DYNAMIC_TOP_SYMBOLS:
+            print(f"Fetching Top {TOP_SYMBOLS_COUNT} spot symbols by 24h volume...")
             try:
-                # 1. Получаем HTF свечи (4H) для общего тренда
+                symbols_to_scan = client.get_top_volume_symbols(top_n=TOP_SYMBOLS_COUNT)
+                print(f"Loaded {len(symbols_to_scan)} liquid symbols from OKX.")
+            except Exception as exc:
+                print(f"[WARN] Failed to fetch top symbols, using fallback list: {exc}")
+                symbols_to_scan = SYMBOLS
+        else:
+            symbols_to_scan = SYMBOLS
+
+        # 2. Основной цикл сканирования
+        total = len(symbols_to_scan)
+        for idx, symbol in enumerate(symbols_to_scan, 1):
+            try:
+                # Пауза 50мс для защиты от rate-limit OKX при большом списке
+                time.sleep(0.05)
+
                 df_htf = client.get_candles(
                     symbol=symbol,
                     timeframe=HTF_TIMEFRAME,
@@ -157,7 +152,6 @@ def run_scanner() -> None:
                     closed_only=True,
                 )
 
-                # 2. Получаем LTF свечи (15m) для поиска сетапов
                 df_ltf = client.get_candles(
                     symbol=symbol,
                     timeframe=ENTRY_TIMEFRAME,
@@ -165,47 +159,37 @@ def run_scanner() -> None:
                     closed_only=True,
                 )
             except OKXError as exc:
-                print(f"[{symbol}] OKX API Error: {exc}")
                 continue
-            except Exception as exc:
-                print(f"[{symbol}] Unexpected error: {exc}")
+            except Exception:
                 continue
 
-            # 3. Анализируем структуру на HTF и LTF
+            # 3. Анализ структуры
             _, htf_state = analyze_structure(df_htf, htf=True)
             structure_ltf, _ = analyze_structure(df_ltf, htf=False)
 
-            print(f"[{symbol}] HTF Trend: {htf_state.trend} | LTF Swings: {len(structure_ltf)}")
-
-            # 4. Ищем сформированные SFP
-            sfps = find_sfps(df_ltf, structure_ltf)
-            if not sfps:
-                print(f"[{symbol}] No valid SFP found.")
+            if htf_state.trend not in {"BULLISH", "BEARISH"}:
                 continue
 
-            # 5. Ищем подтверждённый MSS после SFP
+            # 4. Поиск SFP и MSS
+            sfps = find_sfps(df_ltf, structure_ltf)
+            if not sfps:
+                continue
+
             result = find_latest_mss(df_ltf, sfps, structure_ltf)
             if result is None:
-                print(f"[{symbol}] SFP found, but no confirmed MSS yet.")
                 continue
 
             sfp, mss = result
 
-            # 6. Проверяем инвалидацию
-            if is_sfp_invalidated(df_ltf, sfp):
-                print(f"[{symbol}] Setup invalidated: SFP extreme violated.")
+            # 5. Проверка инвалидации
+            if is_sfp_invalidated(df_ltf, sfp) or is_mss_invalidated(df_ltf, sfp, mss):
                 continue
 
-            if is_mss_invalidated(df_ltf, sfp, mss):
-                print(f"[{symbol}] Setup invalidated: MSS violated.")
-                continue
-
-            # 7. Проверяем cooldown
+            # 6. Проверка кулдауна
             if is_on_cooldown(symbol, sfp.direction, state):
-                print(f"[{symbol}] Signal {sfp.direction} is on cooldown. Skipping.")
                 continue
 
-            # 8. Генерируем торговый сигнал с пользовательским балансом и риском
+            # 7. Финальная фильтрация и расчёт риска
             signal = generate_signal(
                 symbol=symbol,
                 timeframe=ENTRY_TIMEFRAME,
@@ -219,40 +203,28 @@ def run_scanner() -> None:
             )
 
             if signal is None:
-                reasons = get_signal_failure_reasons(
-                    df=df_ltf,
-                    sfp=sfp,
-                    mss=mss,
-                    structure=structure_ltf,
-                    htf_state=htf_state,
-                )
-                print(f"[{symbol}] Setup did not pass filters: {'; '.join(reasons)}")
                 continue
 
-            # 9. Успешный сигнал
+            # 8. Отправка сигнала
             signals_found += 1
-            print(f"[{symbol}] 🎯 VALID SIGNAL GENERATED! Direction: {signal.direction} | Score: {signal.signal_score:.1f}")
+            print(f"\n🎯 [{idx}/{total}] VALID SIGNAL: {signal.symbol} {signal.direction} | Score: {signal.signal_score:.1f}")
 
-            # Отправка в Telegram
             if telegram.is_configured:
                 sent = telegram.send_signal(signal)
                 if sent:
-                    print(f"[{symbol}] Signal successfully sent to Telegram.")
+                    print(f"[{symbol}] Sent to Telegram successfully.")
                     record_signal_sent(symbol, signal.direction, state)
                     signals_sent += 1
-                else:
-                    print(f"[{symbol}] Failed to send signal to Telegram.")
             else:
-                print(f"[{symbol}] Telegram not configured, logging locally:")
-                print(f"Entry: {signal.entry} | SL: {signal.stop_loss} | TP1: {signal.tp1} | TP2: {signal.tp2}")
                 record_signal_sent(symbol, signal.direction, state)
 
-    # Сохраняем состояние cooldown
-    save_signal_state(state)
+        # Выводим компактный прогресс
+        print(f"\nCompleted scan of {total} coins.")
 
-    print("\n" + "=" * 60)
+    save_signal_state(state)
+    print("=" * 65)
     print(f"Scan finished. Signals Found: {signals_found} | Signals Sent: {signals_sent}")
-    print("=" * 60)
+    print("=" * 65)
 
 
 if __name__ == "__main__":

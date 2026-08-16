@@ -1,5 +1,5 @@
 # ============================================================
-# MAIN SCANNER PIPELINE (TOP 200 COINS WITH DETAILED LOGS)
+# MAIN SCANNER PIPELINE (TREND + COUNTER-TREND SUPPORT)
 # SFP + MSS BOT
 # ============================================================
 
@@ -24,6 +24,7 @@ from config import (
     SIGNAL_STATE_FILE,
     DEFAULT_RISK_PERCENT,
     SIGNAL_COOLDOWN_MINUTES,
+    ENABLE_COUNTER_TREND_SIGNALS,
 )
 
 from core.okx import OKXClient, OKXError
@@ -119,10 +120,9 @@ def run_scanner() -> None:
     print("=" * 70)
     print(f"Starting SFP + MSS Scanner at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
     print(f"Account Balance: ${account_balance:,.2f} | Risk per Trade: {risk_percent:.2f}%")
-    print(f"HTF: {HTF_TIMEFRAME} | LTF: {ENTRY_TIMEFRAME}")
+    print(f"HTF: {HTF_TIMEFRAME} | LTF: {ENTRY_TIMEFRAME} | Counter-Trend Allowed: {ENABLE_COUNTER_TREND_SIGNALS}")
     print("=" * 70)
 
-    # Статистика фильтрации
     stats = {
         "total_scanned": 0,
         "skipped_htf": 0,
@@ -131,12 +131,12 @@ def run_scanner() -> None:
         "invalidated": 0,
         "cooldown": 0,
         "filter_rejected": 0,
-        "signals_generated": 0,
+        "signals_trend": 0,
+        "signals_counter_trend": 0,
         "signals_sent": 0,
     }
 
     with OKXClient() as client:
-        # 1. Получаем список монет для сканирования
         if DYNAMIC_TOP_SYMBOLS:
             print(f"\n[INFO] Fetching Top {TOP_SYMBOLS_COUNT} spot symbols by 24h volume from OKX...")
             try:
@@ -151,12 +151,11 @@ def run_scanner() -> None:
         total = len(symbols_to_scan)
         stats["total_scanned"] = total
 
-        # 2. Основной цикл сканирования
         for idx, symbol in enumerate(symbols_to_scan, 1):
             tag = f"[{idx:03d}/{total:03d}] {symbol}"
 
             try:
-                time.sleep(0.05)  # Защита от rate-limit OKX
+                time.sleep(0.05)
 
                 df_htf = client.get_candles(
                     symbol=symbol,
@@ -178,7 +177,7 @@ def run_scanner() -> None:
                 print(f"{tag} -> ❌ Data fetch error: {exc}")
                 continue
 
-            # 3. Анализ структуры
+            # Анализ структуры
             _, htf_state = analyze_structure(df_htf, htf=True)
             structure_ltf, _ = analyze_structure(df_ltf, htf=False)
 
@@ -187,14 +186,14 @@ def run_scanner() -> None:
                 print(f"{tag} -> ⏭ Skipped: HTF trend is {htf_state.trend} (no clear directional bias)")
                 continue
 
-            # 4. Поиск SFP
+            # SFP
             sfps = find_sfps(df_ltf, structure_ltf)
             if not sfps:
                 stats["no_sfp"] += 1
                 print(f"{tag} -> ⏭ HTF: {htf_state.trend} | No valid SFP found on LTF")
                 continue
 
-            # 5. Поиск MSS
+            # MSS
             result = find_latest_mss(df_ltf, sfps, structure_ltf)
             if result is None:
                 stats["no_mss"] += 1
@@ -204,7 +203,7 @@ def run_scanner() -> None:
 
             sfp, mss = result
 
-            # 6. Проверка инвалидации
+            # Инвалидация
             if is_sfp_invalidated(df_ltf, sfp):
                 stats["invalidated"] += 1
                 print(f"{tag} -> ⏭ Setup invalidated: SFP extreme breached")
@@ -215,13 +214,13 @@ def run_scanner() -> None:
                 print(f"{tag} -> ⏭ Setup invalidated: MSS level breached")
                 continue
 
-            # 7. Проверка кулдауна
+            # Кулдаун
             if is_on_cooldown(symbol, sfp.direction, state):
                 stats["cooldown"] += 1
-                print(f"{tag} -> ⏭ Signal {sfp.direction} is on cooldown (already alerted recently)")
+                print(f"{tag} -> ⏭ Signal {sfp.direction} is on cooldown")
                 continue
 
-            # 8. Финальная оценка через фильтры
+            # Фильтрация и генерация (с поддержкой контртренда)
             signal = generate_signal(
                 symbol=symbol,
                 timeframe=ENTRY_TIMEFRAME,
@@ -232,6 +231,7 @@ def run_scanner() -> None:
                 htf_state=htf_state,
                 balance=account_balance,
                 risk_percent=risk_percent,
+                allow_counter_trend=ENABLE_COUNTER_TREND_SIGNALS,
             )
 
             if signal is None:
@@ -242,15 +242,22 @@ def run_scanner() -> None:
                     mss=mss,
                     structure=structure_ltf,
                     htf_state=htf_state,
+                    allow_counter_trend=ENABLE_COUNTER_TREND_SIGNALS,
                 )
                 reasons_str = "; ".join(reasons) if reasons else "Filters not met"
-                print(f"{tag} -> ⚠️ SFP+MSS found ({sfp.direction}), but REJECTED by filters: [{reasons_str}]")
+                print(f"{tag} -> ⚠️ SFP+MSS ({sfp.direction}), REJECTED by filters: [{reasons_str}]")
                 continue
 
-            # 9. Успешный сигнал
-            stats["signals_generated"] += 1
+            # Сигнал готов
+            if signal.setup_type == "TREND":
+                stats["signals_trend"] += 1
+                icon = "🎯 [TREND]"
+            else:
+                stats["signals_counter_trend"] += 1
+                icon = "⚡️ [PULLBACK/COUNTER-TREND]"
+
             print(f"\n{'='*70}")
-            print(f"🎯 {tag} -> VALID SIGNAL: {signal.direction} | Score: {signal.signal_score:.1f} | Entry: {signal.entry} | SL: {signal.stop_loss}")
+            print(f"{icon} {tag} -> VALID SIGNAL: {signal.direction} | Score: {signal.signal_score:.1f} | Entry: {signal.entry} | SL: {signal.stop_loss}")
             print(f"{'='*70}\n")
 
             if telegram.is_configured:
@@ -265,21 +272,20 @@ def run_scanner() -> None:
                 print(f"{tag} -> ℹ️ Telegram not configured, recorded locally.")
                 record_signal_sent(symbol, signal.direction, state)
 
-    # Сохраняем состояние отправленных сигналов
     save_signal_state(state)
 
-    # Итоговый отчёт
     print("\n" + "=" * 70)
     print("📊 SCAN SUMMARY REPORT:")
-    print(f"• Total coins scanned:         {stats['total_scanned']}")
-    print(f"• Skipped (HTF trend mixed):    {stats['skipped_htf']}")
-    print(f"• Skipped (No SFP pattern):    {stats['no_sfp']}")
-    print(f"• Skipped (SFP found, no MSS): {stats['no_mss']}")
-    print(f"• Skipped (Invalidated):       {stats['invalidated']}")
-    print(f"• Skipped (Cooldown active):   {stats['cooldown']}")
-    print(f"• Rejected by Quality Filters: {stats['filter_rejected']}")
-    print(f"• Valid Signals Generated:     {stats['signals_generated']}")
-    print(f"• Signals Sent to Telegram:    {stats['signals_sent']}")
+    print(f"• Total coins scanned:           {stats['total_scanned']}")
+    print(f"• Skipped (HTF trend mixed):      {stats['skipped_htf']}")
+    print(f"• Skipped (No SFP pattern):      {stats['no_sfp']}")
+    print(f"• Skipped (SFP found, no MSS):   {stats['no_mss']}")
+    print(f"• Skipped (Invalidated):         {stats['invalidated']}")
+    print(f"• Skipped (Cooldown active):     {stats['cooldown']}")
+    print(f"• Rejected by Quality Filters:   {stats['filter_rejected']}")
+    print(f"• Trend Signals (4H aligned):    {stats['signals_trend']}")
+    print(f"• Pullback Signals (Counter-4H): {stats['signals_counter_trend']}")
+    print(f"• Signals Sent to Telegram:      {stats['signals_sent']}")
     print("=" * 70)
 
 

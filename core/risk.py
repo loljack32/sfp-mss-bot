@@ -1,11 +1,13 @@
 # ============================================================
-# RISK MANAGEMENT
+# RISK MANAGEMENT WITH LEVERAGE & MARGIN
 # ============================================================
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+
+from config import DEFAULT_LEVERAGE
 
 
 # ============================================================
@@ -15,28 +17,28 @@ from typing import Optional
 @dataclass(frozen=True)
 class RiskCalculation:
     """
-    Полный результат расчёта торговой позиции.
-
-    Все значения относятся к одной конкретной сделке.
+    Полный результат расчёта позиции с учётом кредитного плеча и маржи.
     """
 
     balance: float
-
     risk_percent: float
     risk_amount: float
+    leverage: int
+
+    margin_required: float          # Сколько своих $ нужно в сделку
+    effective_leverage: float       # Фактическое используемое плечо
+    estimated_liquidation: float    # Расчетная цена ликвидации
 
     entry: float
     stop_loss: float
-
     stop_distance: float
     stop_distance_percent: float
 
-    position_size: float
-    position_notional: float
+    position_size: float            # Количество монет
+    position_notional: float        # Полная стоимость позиции в $
 
     tp1: float
     tp2: float
-
     rr_tp1: float
     rr_tp2: float
 
@@ -45,250 +47,64 @@ class RiskCalculation:
 # VALIDATION
 # ============================================================
 
-def validate_balance(
-    balance: float,
-) -> None:
-    """
-    Проверяет баланс пользователя.
-    """
-
+def validate_balance(balance: float) -> None:
     if balance <= 0:
-        raise ValueError(
-            "Balance must be greater than zero."
-        )
+        raise ValueError("Balance must be greater than zero.")
 
 
-def validate_risk_percent(
-    risk_percent: float,
-) -> None:
-    """
-    Проверяет процент риска.
-
-    Например:
-
-        1.0  = 1%
-        0.5  = 0.5%
-        2.0  = 2%
-    """
-
+def validate_risk_percent(risk_percent: float) -> None:
     if risk_percent <= 0:
-        raise ValueError(
-            "Risk percent must be greater than zero."
-        )
-
+        raise ValueError("Risk percent must be greater than zero.")
     if risk_percent > 100:
-        raise ValueError(
-            "Risk percent cannot exceed 100%."
-        )
+        raise ValueError("Risk percent cannot exceed 100%.")
 
 
-def validate_prices(
-    entry: float,
-    stop_loss: float,
-) -> None:
-    """
-    Проверяет корректность Entry и SL.
-    """
-
+def validate_prices(entry: float, stop_loss: float) -> None:
     if entry <= 0:
-        raise ValueError(
-            "Entry price must be greater than zero."
-        )
-
+        raise ValueError("Entry price must be greater than zero.")
     if stop_loss <= 0:
-        raise ValueError(
-            "Stop loss must be greater than zero."
-        )
+        raise ValueError("Stop loss must be greater than zero.")
 
 
 # ============================================================
-# RISK AMOUNT
+# CALCULATIONS
 # ============================================================
 
-def calculate_risk_amount(
-    balance: float,
-    risk_percent: float,
-) -> float:
-    """
-    Сколько денег пользователь готов потерять
-    при полном срабатывании SL.
-
-    Формула:
-
-        risk_amount =
-            balance × risk_percent / 100
-    """
-
-    validate_balance(
-        balance
-    )
-
-    validate_risk_percent(
-        risk_percent
-    )
-
-    return (
-        balance
-        * risk_percent
-        / 100.0
-    )
+def calculate_risk_amount(balance: float, risk_percent: float) -> float:
+    validate_balance(balance)
+    validate_risk_percent(risk_percent)
+    return balance * risk_percent / 100.0
 
 
-# ============================================================
-# STOP DISTANCE
-# ============================================================
-
-def calculate_stop_distance(
-    direction: str,
-    entry: float,
-    stop_loss: float,
-) -> float:
-    """
-    Расстояние от Entry до SL.
-
-    LONG:
-
-        Entry - SL
-
-    SHORT:
-
-        SL - Entry
-    """
-
-    validate_prices(
-        entry,
-        stop_loss,
-    )
-
+def calculate_stop_distance(direction: str, entry: float, stop_loss: float) -> float:
+    validate_prices(entry, stop_loss)
     if direction == "LONG":
-
-        distance = (
-            entry - stop_loss
-        )
-
+        distance = entry - stop_loss
     elif direction == "SHORT":
-
-        distance = (
-            stop_loss - entry
-        )
-
+        distance = stop_loss - entry
     else:
-
-        raise ValueError(
-            f"Unknown direction: {direction}"
-        )
+        raise ValueError(f"Unknown direction: {direction}")
 
     if distance <= 0:
-        raise ValueError(
-            "Stop loss must be on the correct "
-            "side of the entry."
-        )
-
+        raise ValueError("Stop loss must be on the correct side of the entry.")
     return distance
 
 
-# ============================================================
-# STOP DISTANCE %
-# ============================================================
-
-def calculate_stop_distance_percent(
-    entry: float,
-    stop_distance: float,
-) -> float:
-    """
-    Процент расстояния Entry → SL.
-    """
-
+def calculate_stop_distance_percent(entry: float, stop_distance: float) -> float:
     if entry <= 0:
-        raise ValueError(
-            "Entry must be greater than zero."
-        )
-
-    return (
-        stop_distance
-        / entry
-        * 100.0
-    )
+        raise ValueError("Entry must be greater than zero.")
+    return (stop_distance / entry) * 100.0
 
 
-# ============================================================
-# POSITION SIZE
-# ============================================================
-
-def calculate_position_size(
-    risk_amount: float,
-    stop_distance: float,
-) -> float:
-    """
-    Рассчитывает количество базового актива.
-
-    Формула:
-
-        position_size =
-            risk_amount / stop_distance
-
-    Пример:
-
-        risk = 10 USDT
-        Entry = 100
-        SL = 98
-
-        distance = 2
-
-        position = 10 / 2 = 5
-    """
-
-    if risk_amount <= 0:
-        raise ValueError(
-            "Risk amount must be greater than zero."
-        )
-
-    if stop_distance <= 0:
-        raise ValueError(
-            "Stop distance must be greater than zero."
-        )
-
-    return (
-        risk_amount
-        / stop_distance
-    )
+def calculate_position_size(risk_amount: float, stop_distance: float) -> float:
+    if risk_amount <= 0 or stop_distance <= 0:
+        raise ValueError("Risk amount and stop distance must be greater than zero.")
+    return risk_amount / stop_distance
 
 
-# ============================================================
-# POSITION NOTIONAL
-# ============================================================
+def calculate_position_notional(entry: float, position_size: float) -> float:
+    return entry * position_size
 
-def calculate_position_notional(
-    entry: float,
-    position_size: float,
-) -> float:
-    """
-    Номинальная стоимость позиции.
-
-    Формула:
-
-        position_size × entry
-    """
-
-    if entry <= 0:
-        raise ValueError(
-            "Entry must be greater than zero."
-        )
-
-    if position_size <= 0:
-        raise ValueError(
-            "Position size must be greater than zero."
-        )
-
-    return (
-        entry
-        * position_size
-    )
-
-
-# ============================================================
-# TP BY R
-# ============================================================
 
 def calculate_take_profit(
     direction: str,
@@ -296,55 +112,12 @@ def calculate_take_profit(
     stop_distance: float,
     rr: float,
 ) -> float:
-    """
-    Рассчитывает TP на заданном R.
-
-    LONG:
-
-        TP = Entry + RiskDistance × RR
-
-    SHORT:
-
-        TP = Entry - RiskDistance × RR
-    """
-
-    if entry <= 0:
-        raise ValueError(
-            "Entry must be greater than zero."
-        )
-
-    if stop_distance <= 0:
-        raise ValueError(
-            "Stop distance must be greater than zero."
-        )
-
-    if rr <= 0:
-        raise ValueError(
-            "RR must be greater than zero."
-        )
-
     if direction == "LONG":
-
-        return (
-            entry
-            + stop_distance * rr
-        )
-
+        return entry + stop_distance * rr
     if direction == "SHORT":
+        return entry - stop_distance * rr
+    raise ValueError(f"Unknown direction: {direction}")
 
-        return (
-            entry
-            - stop_distance * rr
-        )
-
-    raise ValueError(
-        f"Unknown direction: {direction}"
-    )
-
-
-# ============================================================
-# RR BETWEEN PRICES
-# ============================================================
 
 def calculate_rr(
     direction: str,
@@ -352,39 +125,43 @@ def calculate_rr(
     stop_loss: float,
     target: float,
 ) -> Optional[float]:
-    """
-    Рассчитывает фактический RR между Entry, SL и TP.
-    """
-
     stop_distance = calculate_stop_distance(
         direction=direction,
         entry=entry,
         stop_loss=stop_loss,
     )
-
     if direction == "LONG":
-
-        reward = (
-            target - entry
-        )
-
+        reward = target - entry
     elif direction == "SHORT":
-
-        reward = (
-            entry - target
-        )
-
+        reward = entry - target
     else:
-
         return None
 
     if reward <= 0:
         return None
+    return reward / stop_distance
 
-    return (
-        reward
-        / stop_distance
-    )
+
+def estimate_liquidation_price(
+    direction: str,
+    entry: float,
+    leverage: int,
+    maintenance_margin_rate: float = 0.005,  # 0.5% стандартная ставка поддержки на бирже
+) -> float:
+    """
+    Расчёт ориентировочной цены ликвидации позиции с изолированным плечом.
+    """
+    if leverage <= 1:
+        return 0.0 if direction == "LONG" else entry * 2.0
+
+    if direction == "LONG":
+        # Для лонга цена падает до ликвидации
+        liq_distance_pct = (1.0 / leverage) - maintenance_margin_rate
+        return max(0.0, entry * (1.0 - liq_distance_pct))
+    else:
+        # Для шорта цена растет до ликвидации
+        liq_distance_pct = (1.0 / leverage) - maintenance_margin_rate
+        return entry * (1.0 + liq_distance_pct)
 
 
 # ============================================================
@@ -397,153 +174,60 @@ def calculate_risk(
     risk_percent: float,
     entry: float,
     stop_loss: float,
+    leverage: int = DEFAULT_LEVERAGE,
     tp1_rr: float = 1.0,
     tp2_rr: float = 2.0,
 ) -> RiskCalculation:
-    """
-    Главная функция risk management.
+    validate_balance(balance)
+    validate_risk_percent(risk_percent)
+    validate_prices(entry, stop_loss)
 
-    На вход:
+    leverage = max(1, int(leverage))
 
-        direction
-        balance
-        risk %
-        entry
-        SL
+    # 1. Сумма риска
+    risk_amount = calculate_risk_amount(balance=balance, risk_percent=risk_percent)
 
-    На выход:
+    # 2. Дистанция стопа
+    stop_distance = calculate_stop_distance(direction=direction, entry=entry, stop_loss=stop_loss)
+    stop_distance_percent = calculate_stop_distance_percent(entry=entry, stop_distance=stop_distance)
 
-        risk amount
-        position size
-        position notional
-        TP1
-        TP2
-        фактические RR
-    """
+    # 3. Размер позиции
+    position_size = calculate_position_size(risk_amount=risk_amount, stop_distance=stop_distance)
+    position_notional = calculate_position_notional(entry=entry, position_size=position_size)
 
-    # --------------------------------------------------------
-    # VALIDATION
-    # --------------------------------------------------------
+    # 4. Расчёт маржи и плеча
+    margin_required = position_notional / leverage
+    effective_leverage = position_notional / balance if balance > 0 else 0.0
 
-    validate_balance(
-        balance
-    )
-
-    validate_risk_percent(
-        risk_percent
-    )
-
-    validate_prices(
-        entry,
-        stop_loss,
-    )
-
-    # --------------------------------------------------------
-    # RISK AMOUNT
-    # --------------------------------------------------------
-
-    risk_amount = calculate_risk_amount(
-        balance=balance,
-        risk_percent=risk_percent,
-    )
-
-    # --------------------------------------------------------
-    # STOP DISTANCE
-    # --------------------------------------------------------
-
-    stop_distance = calculate_stop_distance(
+    # 5. Ликвидация
+    estimated_liquidation = estimate_liquidation_price(
         direction=direction,
         entry=entry,
-        stop_loss=stop_loss,
+        leverage=leverage,
     )
 
-    stop_distance_percent = (
-        calculate_stop_distance_percent(
-            entry=entry,
-            stop_distance=stop_distance,
-        )
-    )
+    # 6. Тейк-профиты
+    tp1 = calculate_take_profit(direction=direction, entry=entry, stop_distance=stop_distance, rr=tp1_rr)
+    tp2 = calculate_take_profit(direction=direction, entry=entry, stop_distance=stop_distance, rr=tp2_rr)
 
-    # --------------------------------------------------------
-    # POSITION SIZE
-    # --------------------------------------------------------
+    rr_tp1 = calculate_rr(direction=direction, entry=entry, stop_loss=stop_loss, target=tp1)
+    rr_tp2 = calculate_rr(direction=direction, entry=entry, stop_loss=stop_loss, target=tp2)
 
-    position_size = calculate_position_size(
-        risk_amount=risk_amount,
-        stop_distance=stop_distance,
-    )
-
-    # --------------------------------------------------------
-    # NOTIONAL
-    # --------------------------------------------------------
-
-    position_notional = (
-        calculate_position_notional(
-            entry=entry,
-            position_size=position_size,
-        )
-    )
-
-    # --------------------------------------------------------
-    # TAKE PROFITS
-    # --------------------------------------------------------
-
-    tp1 = calculate_take_profit(
-        direction=direction,
-        entry=entry,
-        stop_distance=stop_distance,
-        rr=tp1_rr,
-    )
-
-    tp2 = calculate_take_profit(
-        direction=direction,
-        entry=entry,
-        stop_distance=stop_distance,
-        rr=tp2_rr,
-    )
-
-    # --------------------------------------------------------
-    # ACTUAL RR
-    # --------------------------------------------------------
-
-    rr_tp1 = calculate_rr(
-        direction=direction,
-        entry=entry,
-        stop_loss=stop_loss,
-        target=tp1,
-    )
-
-    rr_tp2 = calculate_rr(
-        direction=direction,
-        entry=entry,
-        stop_loss=stop_loss,
-        target=tp2,
-    )
-
-    if rr_tp1 is None:
-        raise ValueError(
-            "Unable to calculate TP1 RR."
-        )
-
-    if rr_tp2 is None:
-        raise ValueError(
-            "Unable to calculate TP2 RR."
-        )
-
-    # --------------------------------------------------------
-    # RESULT
-    # --------------------------------------------------------
+    if rr_tp1 is None or rr_tp2 is None:
+        raise ValueError("Unable to calculate TP RR.")
 
     return RiskCalculation(
         balance=balance,
         risk_percent=risk_percent,
         risk_amount=risk_amount,
+        leverage=leverage,
+        margin_required=margin_required,
+        effective_leverage=effective_leverage,
+        estimated_liquidation=estimated_liquidation,
         entry=entry,
         stop_loss=stop_loss,
         stop_distance=stop_distance,
-        stop_distance_percent=(
-            stop_distance_percent
-        ),
+        stop_distance_percent=stop_distance_percent,
         position_size=position_size,
         position_notional=position_notional,
         tp1=tp1,
@@ -553,33 +237,21 @@ def calculate_risk(
     )
 
 
-# ============================================================
-# SERIALIZATION
-# ============================================================
-
-def risk_to_dict(
-    result: RiskCalculation,
-) -> dict:
-    """
-    Преобразует результат расчёта в dict.
-
-    Используется для Telegram / JSON / логирования.
-    """
-
+def risk_to_dict(result: RiskCalculation) -> dict:
     return {
         "balance": result.balance,
         "risk_percent": result.risk_percent,
         "risk_amount": result.risk_amount,
+        "leverage": result.leverage,
+        "margin_required": result.margin_required,
+        "effective_leverage": result.effective_leverage,
+        "estimated_liquidation": result.estimated_liquidation,
         "entry": result.entry,
         "stop_loss": result.stop_loss,
         "stop_distance": result.stop_distance,
-        "stop_distance_percent": (
-            result.stop_distance_percent
-        ),
+        "stop_distance_percent": result.stop_distance_percent,
         "position_size": result.position_size,
-        "position_notional": (
-            result.position_notional
-        ),
+        "position_notional": result.position_notional,
         "tp1": result.tp1,
         "tp2": result.tp2,
         "rr_tp1": result.rr_tp1,

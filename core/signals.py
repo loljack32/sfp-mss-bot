@@ -1,37 +1,35 @@
 # ============================================================
-# SFP + MSS SIGNAL ENGINE
+# SIGNAL ENGINE
+# SFP + MSS TRADING SIGNAL GENERATOR
 # ============================================================
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import pandas as pd
 
 from config import (
+    DEFAULT_RISK_PERCENT,
+    MAX_POSITION_BALANCE_MULTIPLE,
+    MIN_RISK_PERCENT,
+    MAX_RISK_PERCENT,
     TP1_R_MULTIPLE,
     TP2_R_MULTIPLE,
-    MIN_RR,
-    MAX_POSITION_BALANCE_MULTIPLE,
 )
 
 from core.structure import (
     SwingPoint,
     StructureState,
-    analyze_structure,
 )
 
 from core.sfp import (
     SFPSetup,
-    find_latest_sfp,
-    is_sfp_invalidated,
 )
 
 from core.mss import (
     MSSSetup,
-    find_mss_after_sfp,
-    is_mss_invalidated,
 )
 
 from core.filters import (
@@ -54,7 +52,8 @@ class TradingSignal:
     """
     Полностью сформированный торговый сигнал.
 
-    Этот объект уже можно передавать в Telegram.
+    Signal создаётся только после прохождения
+    SFP + MSS + всех обязательных filters + risk validation.
     """
 
     symbol: str
@@ -63,7 +62,7 @@ class TradingSignal:
 
     timeframe: str
 
-    signal_timestamp: pd.Timestamp
+    timestamp: pd.Timestamp
 
     entry: float
 
@@ -73,159 +72,169 @@ class TradingSignal:
 
     tp2: float
 
-    risk_calculation: RiskCalculation
+    rr_tp1: float
+
+    rr_tp2: float
+
+    risk_percent: float
+
+    risk_amount: float
+
+    position_size: float
+
+    position_notional: float
+
+    stop_distance: float
+
+    stop_distance_percent: float
+
+    signal_score: float
+
+    sfp_score: float
+
+    mss_score: float
+
+    htf_trend: str
+
+    liquidity_target: Optional[float]
+
+    liquidity_target_label: Optional[str]
 
     sfp: SFPSetup
 
     mss: MSSSetup
 
-    score: float
-
-    rr_tp1: float
-
-    rr_tp2: float
-
-    htf_trend: str
-
-    structure_label: str
-
-    liquidity_target: Optional[float]
-
-    warnings: tuple[str, ...]
+    filters: FilterResult
 
 
 # ============================================================
-# HELPERS
+# RISK VALIDATION
 # ============================================================
 
-def _get_entry_price(
-    df: pd.DataFrame,
-    mss: MSSSetup,
-) -> float:
+def validate_risk_percent_for_signal(
+    risk_percent: float,
+) -> None:
     """
-    Определяет цену входа.
+    Проверяет риск относительно настроек бота.
 
-    Для подтверждённого MSS используем close
-    MSS-свечи.
-
-    Это позволяет не отправлять сигнал
-    по случайной цене внутри свечи.
+    В отличие от validate_risk_percent() из risk.py,
+    здесь используется диапазон, разрешённый конфигурацией бота.
     """
 
-    if mss.break_index < 0:
+    if risk_percent < MIN_RISK_PERCENT:
 
         raise ValueError(
-            "Invalid MSS break index."
+            f"Risk percent {risk_percent:.2f}% "
+            f"is below configured minimum "
+            f"{MIN_RISK_PERCENT:.2f}%."
         )
 
-    if mss.break_index >= len(df):
+    if risk_percent > MAX_RISK_PERCENT:
 
         raise ValueError(
-            "MSS break index is outside DataFrame."
+            f"Risk percent {risk_percent:.2f}% "
+            f"exceeds configured maximum "
+            f"{MAX_RISK_PERCENT:.2f}%."
         )
-
-    entry = float(
-        df.iloc[
-            mss.break_index
-        ]["close"]
-    )
-
-    if entry <= 0:
-
-        raise ValueError(
-            "Entry price must be greater than zero."
-        )
-
-    return entry
 
 
 # ============================================================
-# RISK LIMIT
+# POSITION SIZE VALIDATION
 # ============================================================
 
-def _check_position_limit(
-    risk: RiskCalculation,
-) -> tuple[bool, str]:
+def validate_position_notional(
+    balance: float,
+    position_notional: float,
+) -> None:
     """
-    Защита от ненормально большого номинала позиции.
+    Защита от аномально большой позиции.
 
     Например:
 
         balance = 1000
-        max multiple = 10
+        MAX_POSITION_BALANCE_MULTIPLE = 10
 
     Максимальный notional:
 
-        10000
+        10 000
     """
 
-    max_notional = (
-        risk.balance
+    if balance <= 0:
+
+        raise ValueError(
+            "Balance must be greater than zero."
+        )
+
+    if position_notional <= 0:
+
+        raise ValueError(
+            "Position notional must be greater than zero."
+        )
+
+    maximum_notional = (
+        balance
         * MAX_POSITION_BALANCE_MULTIPLE
     )
 
-    if risk.position_notional > max_notional:
-
-        return (
-            False,
-            (
-                "Position notional "
-                f"{risk.position_notional:.4f} "
-                "exceeds configured maximum "
-                f"{MAX_POSITION_BALANCE_MULTIPLE:.2f}x "
-                "balance."
-            ),
-        )
-
-    return True, "Position size is within limits."
-
-
-# ============================================================
-# SIGNAL VALIDATION
-# ============================================================
-
-def _validate_signal_prices(
-    direction: str,
-    entry: float,
-    stop_loss: float,
-    tp1: float,
-    tp2: float,
-) -> None:
-    """
-    Проверяет геометрию LONG/SHORT сигнала.
-    """
-
-    if direction == "LONG":
-
-        if not (
-            stop_loss < entry
-            < tp1
-            < tp2
-        ):
-
-            raise ValueError(
-                "Invalid LONG signal price structure: "
-                "expected SL < Entry < TP1 < TP2."
-            )
-
-    elif direction == "SHORT":
-
-        if not (
-            tp2
-            < tp1
-            < entry
-            < stop_loss
-        ):
-
-            raise ValueError(
-                "Invalid SHORT signal price structure: "
-                "expected TP2 < TP1 < Entry < SL."
-            )
-
-    else:
+    if position_notional > maximum_notional:
 
         raise ValueError(
-            f"Unknown signal direction: {direction}"
+            "Position notional exceeds configured "
+            f"maximum of {MAX_POSITION_BALANCE_MULTIPLE:.2f}x "
+            "account balance."
+        )
+
+
+# ============================================================
+# SIGNAL DIRECTION VALIDATION
+# ============================================================
+
+def validate_signal_components(
+    sfp: SFPSetup,
+    mss: MSSSetup,
+) -> None:
+    """
+    Проверяет согласованность SFP и MSS.
+
+    LONG:
+
+        SFP LONG
+        MSS LONG
+
+    SHORT:
+
+        SFP SHORT
+        MSS SHORT
+    """
+
+    if sfp.direction not in {
+        "LONG",
+        "SHORT",
+    }:
+
+        raise ValueError(
+            f"Invalid SFP direction: {sfp.direction}"
+        )
+
+    if mss.direction not in {
+        "LONG",
+        "SHORT",
+    }:
+
+        raise ValueError(
+            f"Invalid MSS direction: {mss.direction}"
+        )
+
+    if sfp.direction != mss.direction:
+
+        raise ValueError(
+            "SFP and MSS directions do not match."
+        )
+
+    if mss.break_index <= sfp.sweep_index:
+
+        raise ValueError(
+            "MSS must occur after SFP."
         )
 
 
@@ -235,280 +244,160 @@ def _validate_signal_prices(
 
 def build_signal(
     symbol: str,
-    entry_df: pd.DataFrame,
-    htf_df: pd.DataFrame,
+    timeframe: str,
+    df: pd.DataFrame,
+    sfp: SFPSetup,
+    mss: MSSSetup,
+    structure: List[SwingPoint],
+    htf_state: StructureState,
     balance: float,
-    risk_percent: float,
-    timeframe: str = "15m",
-) -> Optional[TradingSignal]:
+    risk_percent: float = DEFAULT_RISK_PERCENT,
+    entry_price: Optional[float] = None,
+) -> TradingSignal:
     """
-    Главная функция создания торгового сигнала.
+    Создаёт готовый торговый сигнал.
 
     Pipeline:
 
-        1. HTF structure
-        2. Entry structure
-        3. SFP
-        4. MSS
-        5. Filters
-        6. Entry
-        7. SL
-        8. TP1 / TP2
-        9. Position size
-        10. Final validation
+        SFP
+          ↓
+        MSS
+          ↓
+        Filters
+          ↓
+        SL
+          ↓
+        TP
+          ↓
+        Position size
+          ↓
+        TradingSignal
 
-    Если сетап не проходит хотя бы один
-    обязательный фильтр — возвращается None.
+    Если любой обязательный этап не проходит,
+    выбрасывается ValueError.
     """
 
-    # ========================================================
+    # --------------------------------------------------------
     # BASIC VALIDATION
-    # ========================================================
-
-    if entry_df.empty:
-
-        return None
-
-    if htf_df.empty:
-
-        return None
-
-    if balance <= 0:
-
-        raise ValueError(
-            "Balance must be greater than zero."
-        )
-
-    if risk_percent <= 0:
-
-        raise ValueError(
-            "Risk percent must be greater than zero."
-        )
-
-    # ========================================================
-    # STRUCTURE
-    # ========================================================
-
-    entry_structure, entry_state = (
-        analyze_structure(
-            entry_df,
-            htf=False,
-        )
-    )
-
-    htf_structure, htf_state = (
-        analyze_structure(
-            htf_df,
-            htf=True,
-        )
-    )
-
-    # --------------------------------------------------------
-    # HTF STRUCTURE MUST BE CLEAR
     # --------------------------------------------------------
 
-    if htf_state.trend not in {
-        "BULLISH",
-        "BEARISH",
-    }:
+    if df.empty:
 
-        return None
+        raise ValueError(
+            "Cannot build signal from empty DataFrame."
+        )
 
-    # ========================================================
-    # SFP
-    # ========================================================
+    if not symbol:
 
-    sfp = find_latest_sfp(
-        df=entry_df,
-        structure=entry_structure,
-    )
+        raise ValueError(
+            "Symbol must not be empty."
+        )
 
-    if sfp is None:
+    if not timeframe:
 
-        return None
+        raise ValueError(
+            "Timeframe must not be empty."
+        )
 
-    # ========================================================
-    # SFP INVALIDATION
-    # ========================================================
-
-    if is_sfp_invalidated(
-        df=entry_df,
+    validate_signal_components(
         sfp=sfp,
-    ):
-
-        return None
-
-    # ========================================================
-    # MSS
-    # ========================================================
-
-    mss = find_mss_after_sfp(
-        df=entry_df,
-        sfp=sfp,
-        structure=entry_structure,
-    )
-
-    if mss is None:
-
-        return None
-
-    # ========================================================
-    # MSS INVALIDATION
-    # ========================================================
-
-    if is_mss_invalidated(
-        df=entry_df,
-        sfp=sfp,
-        mss=mss,
-    ):
-
-        return None
-
-    # ========================================================
-    # SIGNAL MUST BE FROM LATEST CLOSED DATA
-    # ========================================================
-
-    latest_index = (
-        len(entry_df) - 1
-    )
-
-    if mss.break_index > latest_index:
-
-        return None
-
-    # ========================================================
-    # ENTRY
-    # ========================================================
-
-    entry = _get_entry_price(
-        df=entry_df,
         mss=mss,
     )
 
-    # ========================================================
+    validate_risk_percent_for_signal(
+        risk_percent=risk_percent,
+    )
+
+    # --------------------------------------------------------
     # FILTERS
-    # ========================================================
+    # --------------------------------------------------------
 
-    filter_result: FilterResult = (
-        evaluate_setup(
-            df=entry_df,
-            sfp=sfp,
-            mss=mss,
-            structure=entry_structure,
-            htf_state=htf_state,
-            entry_price=entry,
-        )
+    filter_result = evaluate_setup(
+        df=df,
+        sfp=sfp,
+        mss=mss,
+        structure=structure,
+        htf_state=htf_state,
+        entry_price=entry_price,
     )
-
-    # --------------------------------------------------------
-    # FILTER RESULT
-    # --------------------------------------------------------
 
     if not filter_result.passed:
 
-        return None
-
-    # ========================================================
-    # EXTRACT SL
-    # ========================================================
-
-    stop_loss_value = (
-        filter_result.metrics.get(
-            "stop_loss"
+        reasons = "; ".join(
+            filter_result.reasons
         )
+
+        raise ValueError(
+            "Signal failed filters: "
+            f"{reasons}"
+        )
+
+    # --------------------------------------------------------
+    # ENTRY
+    # --------------------------------------------------------
+
+    if entry_price is None:
+
+        entry = float(
+            df.iloc[-1]["close"]
+        )
+
+    else:
+
+        entry = float(
+            entry_price
+        )
+
+    if entry <= 0:
+
+        raise ValueError(
+            "Signal entry must be greater than zero."
+        )
+
+    # --------------------------------------------------------
+    # STOP LOSS
+    # --------------------------------------------------------
+
+    stop_loss = filter_result.metrics.get(
+        "stop_loss"
     )
 
-    if stop_loss_value is None:
+    if stop_loss is None:
 
-        return None
+        raise ValueError(
+            "Filter result does not contain a valid stop loss."
+        )
 
     stop_loss = float(
-        stop_loss_value
+        stop_loss
     )
 
-    # ========================================================
-    # STOP VALIDATION
-    # ========================================================
-
-    if stop_loss <= 0:
-
-        return None
-
-    # ========================================================
+    # --------------------------------------------------------
     # RISK CALCULATION
-    # ========================================================
+    # --------------------------------------------------------
 
-    try:
-
-        risk = calculate_risk(
-            direction=sfp.direction,
-            balance=balance,
-            risk_percent=risk_percent,
-            entry=entry,
-            stop_loss=stop_loss,
-            tp1_rr=TP1_R_MULTIPLE,
-            tp2_rr=TP2_R_MULTIPLE,
-        )
-
-    except ValueError:
-
-        return None
-
-    # ========================================================
-    # TP
-    # ========================================================
-
-    tp1 = float(
-        risk.tp1
+    risk = calculate_risk(
+        direction=sfp.direction,
+        balance=balance,
+        risk_percent=risk_percent,
+        entry=entry,
+        stop_loss=stop_loss,
+        tp1_rr=TP1_R_MULTIPLE,
+        tp2_rr=TP2_R_MULTIPLE,
     )
 
-    tp2 = float(
-        risk.tp2
-    )
-
-    # ========================================================
-    # PRICE STRUCTURE VALIDATION
-    # ========================================================
-
-    try:
-
-        _validate_signal_prices(
-            direction=sfp.direction,
-            entry=entry,
-            stop_loss=stop_loss,
-            tp1=tp1,
-            tp2=tp2,
-        )
-
-    except ValueError:
-
-        return None
-
-    # ========================================================
-    # RR VALIDATION
-    # ========================================================
-
-    if risk.rr_tp2 < MIN_RR:
-
-        return None
-
-    # ========================================================
+    # --------------------------------------------------------
     # POSITION LIMIT
-    # ========================================================
+    # --------------------------------------------------------
 
-    position_ok, _ = (
-        _check_position_limit(
-            risk
-        )
+    validate_position_notional(
+        balance=balance,
+        position_notional=risk.position_notional,
     )
 
-    if not position_ok:
-
-        return None
-
-    # ========================================================
+    # --------------------------------------------------------
     # LIQUIDITY TARGET
-    # ========================================================
+    # --------------------------------------------------------
 
     liquidity_target = (
         filter_result.metrics.get(
@@ -522,259 +411,376 @@ def build_signal(
             liquidity_target
         )
 
-    # ========================================================
+    liquidity_target_label = (
+        filter_result.metrics.get(
+            "liquidity_target_label"
+        )
+    )
+
+    # --------------------------------------------------------
     # SIGNAL TIMESTAMP
-    # ========================================================
+    # --------------------------------------------------------
 
-    signal_timestamp = (
-        entry_df.iloc[
-            mss.break_index
-        ]["timestamp"]
-    )
+    timestamp = df.iloc[-1]["timestamp"]
 
-    # ========================================================
-    # WARNINGS
-    # ========================================================
+    if not isinstance(
+        timestamp,
+        pd.Timestamp,
+    ):
 
-    warnings = tuple(
-        filter_result.warnings
-    )
+        timestamp = pd.Timestamp(
+            timestamp
+        )
 
-    # ========================================================
-    # BUILD
-    # ========================================================
+    # --------------------------------------------------------
+    # FINAL SIGNAL
+    # --------------------------------------------------------
 
     return TradingSignal(
         symbol=symbol,
-
         direction=sfp.direction,
-
         timeframe=timeframe,
-
-        signal_timestamp=signal_timestamp,
+        timestamp=timestamp,
 
         entry=entry,
 
-        stop_loss=stop_loss,
+        stop_loss=risk.stop_loss,
 
-        tp1=tp1,
+        tp1=risk.tp1,
+        tp2=risk.tp2,
 
-        tp2=tp2,
+        rr_tp1=risk.rr_tp1,
+        rr_tp2=risk.rr_tp2,
 
-        risk_calculation=risk,
+        risk_percent=risk.risk_percent,
+        risk_amount=risk.risk_amount,
 
-        sfp=sfp,
+        position_size=risk.position_size,
+        position_notional=risk.position_notional,
 
-        mss=mss,
-
-        score=float(
-            filter_result.score
+        stop_distance=risk.stop_distance,
+        stop_distance_percent=(
+            risk.stop_distance_percent
         ),
 
-        rr_tp1=float(
-            risk.rr_tp1
-        ),
+        signal_score=filter_result.score,
 
-        rr_tp2=float(
-            risk.rr_tp2
-        ),
+        sfp_score=sfp.score,
+        mss_score=mss.score,
 
         htf_trend=htf_state.trend,
 
-        structure_label=(
-            mss.structure_label
+        liquidity_target=liquidity_target,
+        liquidity_target_label=(
+            liquidity_target_label
         ),
 
-        liquidity_target=(
-            liquidity_target
-        ),
-
-        warnings=warnings,
+        sfp=sfp,
+        mss=mss,
+        filters=filter_result,
     )
 
 
 # ============================================================
-# SERIALIZATION
+# SIGNAL ENGINE
+# ============================================================
+
+def generate_signal(
+    symbol: str,
+    timeframe: str,
+    df: pd.DataFrame,
+    sfp: Optional[SFPSetup],
+    mss: Optional[MSSSetup],
+    structure: List[SwingPoint],
+    htf_state: StructureState,
+    balance: float,
+    risk_percent: float = DEFAULT_RISK_PERCENT,
+    entry_price: Optional[float] = None,
+) -> Optional[TradingSignal]:
+    """
+    Безопасная обёртка над build_signal().
+
+    В отличие от build_signal():
+
+        отсутствие SFP/MSS
+        или провал фильтров
+
+    не является исключением для основного scanner loop.
+
+    Возвращается:
+
+        TradingSignal
+            если сигнал полностью прошёл проверки.
+
+        None
+            если торгового сигнала нет.
+    """
+
+    if sfp is None:
+
+        return None
+
+    if mss is None:
+
+        return None
+
+    try:
+
+        return build_signal(
+            symbol=symbol,
+            timeframe=timeframe,
+            df=df,
+            sfp=sfp,
+            mss=mss,
+            structure=structure,
+            htf_state=htf_state,
+            balance=balance,
+            risk_percent=risk_percent,
+            entry_price=entry_price,
+        )
+
+    except ValueError:
+
+        return None
+
+
+# ============================================================
+# SIGNAL SUMMARY
 # ============================================================
 
 def signal_to_dict(
     signal: TradingSignal,
 ) -> dict:
     """
-    Преобразует сигнал в JSON-compatible dict.
-    """
+    Преобразует TradingSignal в обычный dict.
 
-    risk = (
-        signal.risk_calculation
-    )
+    Используется Telegram, JSON и логированием.
+    """
 
     return {
         "symbol": signal.symbol,
-
         "direction": signal.direction,
-
         "timeframe": signal.timeframe,
-
-        "signal_timestamp": str(
-            signal.signal_timestamp
+        "timestamp": str(
+            signal.timestamp
         ),
 
         "entry": signal.entry,
-
         "stop_loss": signal.stop_loss,
 
         "tp1": signal.tp1,
-
         "tp2": signal.tp2,
 
-        "balance": risk.balance,
-
-        "risk_percent": (
-            risk.risk_percent
-        ),
-
-        "risk_amount": (
-            risk.risk_amount
-        ),
-
-        "position_size": (
-            risk.position_size
-        ),
-
-        "position_notional": (
-            risk.position_notional
-        ),
-
-        "stop_distance": (
-            risk.stop_distance
-        ),
-
-        "stop_distance_percent": (
-            risk.stop_distance_percent
-        ),
-
         "rr_tp1": signal.rr_tp1,
-
         "rr_tp2": signal.rr_tp2,
 
-        "score": signal.score,
+        "risk_percent": signal.risk_percent,
+        "risk_amount": signal.risk_amount,
+
+        "position_size": signal.position_size,
+        "position_notional": signal.position_notional,
+
+        "stop_distance": signal.stop_distance,
+        "stop_distance_percent": (
+            signal.stop_distance_percent
+        ),
+
+        "signal_score": signal.signal_score,
+
+        "sfp_score": signal.sfp_score,
+        "mss_score": signal.mss_score,
 
         "htf_trend": signal.htf_trend,
-
-        "structure_label": (
-            signal.structure_label
-        ),
 
         "liquidity_target": (
             signal.liquidity_target
         ),
 
-        "sfp": {
-            "direction": (
-                signal.sfp.direction
-            ),
-
-            "level": (
-                signal.sfp.level
-            ),
-
-            "sweep_extreme": (
-                signal.sfp.sweep_extreme
-            ),
-
-            "sweep_index": (
-                signal.sfp.sweep_index
-            ),
-
-            "sweep_timestamp": str(
-                signal.sfp.sweep_timestamp
-            ),
-
-            "sweep_atr_ratio": (
-                signal.sfp.sweep_atr_ratio
-            ),
-
-            "reclaim_ratio": (
-                signal.sfp.reclaim_ratio
-            ),
-
-            "score": (
-                signal.sfp.score
-            ),
-        },
-
-        "mss": {
-            "direction": (
-                signal.mss.direction
-            ),
-
-            "structure_level": (
-                signal.mss.structure_level
-            ),
-
-            "structure_label": (
-                signal.mss.structure_label
-            ),
-
-            "break_index": (
-                signal.mss.break_index
-            ),
-
-            "break_timestamp": str(
-                signal.mss.break_timestamp
-            ),
-
-            "break_price": (
-                signal.mss.break_price
-            ),
-
-            "displacement": (
-                signal.mss.displacement
-            ),
-
-            "displacement_atr_ratio": (
-                signal.mss.displacement_atr_ratio
-            ),
-
-            "body_ratio": (
-                signal.mss.body_ratio
-            ),
-
-            "score": (
-                signal.mss.score
-            ),
-        },
-
-        "warnings": list(
-            signal.warnings
+        "liquidity_target_label": (
+            signal.liquidity_target_label
         ),
     }
 
 
 # ============================================================
-# TELEGRAM SUMMARY
+# SIGNAL DESCRIPTION
 # ============================================================
 
-def signal_summary(
+def signal_to_text(
     signal: TradingSignal,
 ) -> str:
     """
-    Формирует краткое представление сигнала.
+    Формирует компактное текстовое представление сигнала.
 
-    Основное Telegram-сообщение будет строиться
-    отдельно в telegram.py.
+    Telegram-форматирование будет находиться
+    в core/telegram.py.
     """
 
-    direction = (
-        "LONG"
+    direction_icon = (
+        "🟢"
         if signal.direction == "LONG"
-        else "SHORT"
+        else "🔴"
     )
 
-    return (
-        f"{signal.symbol} "
-        f"{direction} "
-        f"SFP+MSS | "
-        f"Score {signal.score:.1f} | "
-        f"RR 1:{signal.rr_tp2:.2f}"
+    lines = [
+        f"{direction_icon} {signal.symbol} "
+        f"{signal.direction}",
+
+        f"TF: {signal.timeframe}",
+
+        f"Score: {signal.signal_score:.1f}",
+
+        f"Entry: {signal.entry:.8f}",
+        f"SL: {signal.stop_loss:.8f}",
+
+        f"TP1: {signal.tp1:.8f} "
+        f"(1R / RR {signal.rr_tp1:.2f})",
+
+        f"TP2: {signal.tp2:.8f} "
+        f"(2R / RR {signal.rr_tp2:.2f})",
+
+        f"Risk: {signal.risk_percent:.2f}% "
+        f"({signal.risk_amount:.2f})",
+
+        f"Position: {signal.position_size:.8f}",
+        f"Notional: {signal.position_notional:.2f}",
+
+        f"SFP score: {signal.sfp_score:.1f}",
+        f"MSS score: {signal.mss_score:.1f}",
+
+        f"HTF: {signal.htf_trend}",
+    ]
+
+    if signal.liquidity_target is not None:
+
+        target_text = (
+            f"Liquidity: "
+            f"{signal.liquidity_target:.8f}"
+        )
+
+        if signal.liquidity_target_label:
+
+            target_text += (
+                f" ({signal.liquidity_target_label})"
+            )
+
+        lines.append(
+            target_text
+        )
+
+    return "\n".join(
+        lines
     )
+
+
+# ============================================================
+# FILTER DIAGNOSTICS
+# ============================================================
+
+def get_signal_failure_reasons(
+    df: pd.DataFrame,
+    sfp: Optional[SFPSetup],
+    mss: Optional[MSSSetup],
+    structure: List[SwingPoint],
+    htf_state: StructureState,
+    entry_price: Optional[float] = None,
+) -> List[str]:
+    """
+    Возвращает причины, по которым сетап не может
+    стать торговым сигналом.
+
+    Эта функция предназначена прежде всего для debug/logging.
+
+    В отличие от generate_signal(), она НЕ скрывает
+    причины отказа.
+    """
+
+    reasons: List[str] = []
+
+    if sfp is None:
+
+        reasons.append(
+            "No valid SFP"
+        )
+
+        return reasons
+
+    if mss is None:
+
+        reasons.append(
+            "No valid MSS after SFP"
+        )
+
+        return reasons
+
+    try:
+
+        validate_signal_components(
+            sfp=sfp,
+            mss=mss,
+        )
+
+    except ValueError as exc:
+
+        reasons.append(
+            str(exc)
+        )
+
+        return reasons
+
+    result = evaluate_setup(
+        df=df,
+        sfp=sfp,
+        mss=mss,
+        structure=structure,
+        htf_state=htf_state,
+        entry_price=entry_price,
+    )
+
+    reasons.extend(
+        result.reasons
+    )
+
+    return reasons
+
+
+# ============================================================
+# RISK PREVIEW
+# ============================================================
+
+def preview_risk(
+    direction: str,
+    balance: float,
+    risk_percent: float,
+    entry: float,
+    stop_loss: float,
+) -> RiskCalculation:
+    """
+    Отдельный preview risk calculation.
+
+    Не создаёт торговый сигнал.
+
+    Полезно для Telegram-команды /risk
+    и будущего пользовательского интерфейса.
+    """
+
+    validate_risk_percent_for_signal(
+        risk_percent=risk_percent,
+    )
+
+    result = calculate_risk(
+        direction=direction,
+        balance=balance,
+        risk_percent=risk_percent,
+        entry=entry,
+        stop_loss=stop_loss,
+        tp1_rr=TP1_R_MULTIPLE,
+        tp2_rr=TP2_R_MULTIPLE,
+    )
+
+    validate_position_notional(
+        balance=balance,
+        position_notional=result.position_notional,
+    )
+
+    return result

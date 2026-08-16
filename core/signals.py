@@ -1,6 +1,5 @@
 # ============================================================
-# SIGNAL ENGINE
-# SFP + MSS TRADING SIGNAL GENERATOR
+# SIGNAL ENGINE (WITH LEVERAGE & MARGIN SUPPORT)
 # ============================================================
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ import pandas as pd
 
 from config import (
     DEFAULT_RISK_PERCENT,
+    DEFAULT_LEVERAGE,
     MAX_POSITION_BALANCE_MULTIPLE,
     MIN_RISK_PERCENT,
     MAX_RISK_PERCENT,
@@ -50,15 +50,11 @@ from core.risk import (
 
 @dataclass(frozen=True)
 class TradingSignal:
-    """
-    Полностью сформированный торговый сигнал.
-    """
-
     symbol: str
     direction: str
     timeframe: str
     timestamp: pd.Timestamp
-    setup_type: str  # "TREND" или "COUNTER_TREND"
+    setup_type: str
 
     entry: float
     stop_loss: float
@@ -70,6 +66,11 @@ class TradingSignal:
 
     risk_percent: float
     risk_amount: float
+    leverage: int
+    margin_required: float
+    effective_leverage: float
+    estimated_liquidation: float
+
     position_size: float
     position_notional: float
 
@@ -142,8 +143,11 @@ def build_signal(
     htf_state: StructureState,
     balance: float,
     risk_percent: float = DEFAULT_RISK_PERCENT,
+    leverage: int = DEFAULT_LEVERAGE,
     entry_price: Optional[float] = None,
     allow_counter_trend: bool = ENABLE_COUNTER_TREND_SIGNALS,
+    *args,
+    **kwargs,
 ) -> TradingSignal:
     if df.empty:
         raise ValueError("Cannot build signal from empty DataFrame.")
@@ -178,12 +182,14 @@ def build_signal(
         raise ValueError("Filter result does not contain a valid stop loss.")
     stop_loss = float(stop_loss)
 
+    # Расчёт риска и маржи с учётом плеча
     risk = calculate_risk(
         direction=sfp.direction,
         balance=balance,
         risk_percent=risk_percent,
         entry=entry,
         stop_loss=stop_loss,
+        leverage=leverage,
         tp1_rr=TP1_R_MULTIPLE,
         tp2_rr=TP2_R_MULTIPLE,
     )
@@ -203,12 +209,14 @@ def build_signal(
     if not isinstance(timestamp, pd.Timestamp):
         timestamp = pd.Timestamp(timestamp)
 
+    setup_type = getattr(filter_result, "setup_type", "TREND")
+
     return TradingSignal(
         symbol=symbol,
         direction=sfp.direction,
         timeframe=timeframe,
         timestamp=timestamp,
-        setup_type=filter_result.setup_type,
+        setup_type=setup_type,
         entry=entry,
         stop_loss=risk.stop_loss,
         tp1=risk.tp1,
@@ -217,6 +225,10 @@ def build_signal(
         rr_tp2=risk.rr_tp2,
         risk_percent=risk.risk_percent,
         risk_amount=risk.risk_amount,
+        leverage=risk.leverage,
+        margin_required=risk.margin_required,
+        effective_leverage=risk.effective_leverage,
+        estimated_liquidation=risk.estimated_liquidation,
         position_size=risk.position_size,
         position_notional=risk.position_notional,
         stop_distance=risk.stop_distance,
@@ -247,8 +259,11 @@ def generate_signal(
     htf_state: StructureState,
     balance: float,
     risk_percent: float = DEFAULT_RISK_PERCENT,
+    leverage: int = DEFAULT_LEVERAGE,
     entry_price: Optional[float] = None,
     allow_counter_trend: bool = ENABLE_COUNTER_TREND_SIGNALS,
+    *args,
+    **kwargs,
 ) -> Optional[TradingSignal]:
     if sfp is None or mss is None:
         return None
@@ -264,6 +279,7 @@ def generate_signal(
             htf_state=htf_state,
             balance=balance,
             risk_percent=risk_percent,
+            leverage=leverage,
             entry_price=entry_price,
             allow_counter_trend=allow_counter_trend,
         )
@@ -279,6 +295,8 @@ def get_signal_failure_reasons(
     htf_state: StructureState,
     entry_price: Optional[float] = None,
     allow_counter_trend: bool = ENABLE_COUNTER_TREND_SIGNALS,
+    *args,
+    **kwargs,
 ) -> List[str]:
     reasons: List[str] = []
 
@@ -315,7 +333,7 @@ def signal_to_dict(signal: TradingSignal) -> dict:
         "symbol": signal.symbol,
         "direction": signal.direction,
         "timeframe": signal.timeframe,
-        "setup_type": signal.setup_type,
+        "setup_type": getattr(signal, "setup_type", "TREND"),
         "timestamp": str(signal.timestamp),
         "entry": signal.entry,
         "stop_loss": signal.stop_loss,
@@ -325,6 +343,10 @@ def signal_to_dict(signal: TradingSignal) -> dict:
         "rr_tp2": signal.rr_tp2,
         "risk_percent": signal.risk_percent,
         "risk_amount": signal.risk_amount,
+        "leverage": signal.leverage,
+        "margin_required": signal.margin_required,
+        "effective_leverage": signal.effective_leverage,
+        "estimated_liquidation": signal.estimated_liquidation,
         "position_size": signal.position_size,
         "position_notional": signal.position_notional,
         "stop_distance": signal.stop_distance,
@@ -340,7 +362,8 @@ def signal_to_dict(signal: TradingSignal) -> dict:
 
 def signal_to_text(signal: TradingSignal) -> str:
     direction_icon = "🟢" if signal.direction == "LONG" else "🔴"
-    tactic = "ПО ТРЕНДУ 4H" if signal.setup_type == "TREND" else "КОНТРТРЕНД / ОТКАТ 4H ⚠️"
+    setup_type = getattr(signal, "setup_type", "TREND")
+    tactic = "ПО ТРЕНДУ 4H" if setup_type == "TREND" else "КОНТРТРЕНД / ОТКАТ 4H ⚠️"
 
     lines = [
         f"{direction_icon} {signal.symbol} {signal.direction} [{tactic}]",
@@ -350,11 +373,11 @@ def signal_to_text(signal: TradingSignal) -> str:
         f"SL: {signal.stop_loss:.8f}",
         f"TP1: {signal.tp1:.8f} (1R / RR {signal.rr_tp1:.2f})",
         f"TP2: {signal.tp2:.8f} (2R / RR {signal.rr_tp2:.2f})",
-        f"Risk: {signal.risk_percent:.2f}% ({signal.risk_amount:.2f})",
-        f"Position: {signal.position_size:.8f}",
-        f"Notional: {signal.position_notional:.2f}",
-        f"SFP score: {signal.sfp_score:.1f}",
-        f"MSS score: {signal.mss_score:.1f}",
+        f"Плечо: {signal.leverage}x | Маржа: ${signal.margin_required:.2f}",
+        f"Номинал: ${signal.position_notional:.2f} ({signal.position_size:.6f})",
+        f"Риск: {signal.risk_percent:.2f}% (${signal.risk_amount:.2f})",
+        f"Ликвидация (оценка): {signal.estimated_liquidation:.8f}",
+        f"SFP score: {signal.sfp_score:.1f} | MSS score: {signal.mss_score:.1f}",
         f"HTF: {signal.htf_trend}",
     ]
 
@@ -370,6 +393,7 @@ def preview_risk(
     risk_percent: float,
     entry: float,
     stop_loss: float,
+    leverage: int = DEFAULT_LEVERAGE,
 ) -> RiskCalculation:
     validate_risk_percent_for_signal(risk_percent=risk_percent)
     result = calculate_risk(
@@ -378,6 +402,7 @@ def preview_risk(
         risk_percent=risk_percent,
         entry=entry,
         stop_loss=stop_loss,
+        leverage=leverage,
         tp1_rr=TP1_R_MULTIPLE,
         tp2_rr=TP2_R_MULTIPLE,
     )

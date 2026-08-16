@@ -1,5 +1,5 @@
 # ============================================================
-# TELEGRAM NOTIFIER
+# TELEGRAM NOTIFIER (WITH LEVERAGE & MARGIN DISPLAY)
 # ============================================================
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from core.signals import TradingSignal
 
 def format_signal_message(signal: TradingSignal) -> str:
     """
-    Формирует красивое HTML-сообщение для Telegram с указанием тактики.
+    Формирует красивое HTML-сообщение для Telegram с учётом плеча и маржи.
     """
     is_long = signal.direction == "LONG"
     direction_icon = "🟢" if is_long else "🔴"
@@ -80,10 +80,12 @@ def format_signal_message(signal: TradingSignal) -> str:
 
     lines.extend([
         "",
-        "💼 <b>Risk & Position Size:</b>",
-        f"• Risk: <code>{signal.risk_percent:.2f}%</code> (<code>${signal.risk_amount:,.2f}</code>)",
-        f"• Size: <code>{signal.position_size:,.4f}</code> units",
-        f"• Notional: <code>${signal.position_notional:,.2f}</code>",
+        "💼 <b>Margin & Position Size (Фьючерсы):</b>",
+        f"• ⚡️ <b>Кредитное плечо:</b> <code>{signal.leverage}x</code> (Isolated)",
+        f"• 💵 <b>Маржа (свои деньги):</b> <code>${signal.margin_required:,.2f} USDT</code>",
+        f"• 📦 <b>Номинал позиции:</b> <code>${signal.position_notional:,.2f}</code> ({signal.position_size:,.4f} монет)",
+        f"• ⚠️ <b>Риск при стопе:</b> <code>{signal.risk_percent:.2f}%</code> (<code>${signal.risk_amount:,.2f}</code>)",
+        f"• ☠️ <b>Оценка ликвидации:</b> <code>{fmt_price(signal.estimated_liquidation)}</code>",
         "",
         f"🕒 <i>Candle Time: {signal.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}</i>",
     ])

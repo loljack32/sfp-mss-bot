@@ -8,19 +8,11 @@
 
 OKX_BASE_URL = "https://www.okx.com"
 
-# Включить динамический выбор топ-монет по объёму торгов
 DYNAMIC_TOP_SYMBOLS = True
-
-# Сколько монет из топа сканировать
 TOP_SYMBOLS_COUNT = 200
-
-# Разрешить контртрендовые сигналы (откаты против 4H)
 ENABLE_COUNTER_TREND_SIGNALS = True
-
-# Минимальный суточный объём торгов (в USDT)
 MIN_24H_VOLUME_USDT = 500_000
 
-# Стейблкоины и нежелательные пары
 EXCLUDED_BASE_CURRENCIES = {
     "USDC",
     "USDK",
@@ -35,7 +27,6 @@ EXCLUDED_BASE_CURRENCIES = {
     "USDG",
 }
 
-# Резервный список монет
 SYMBOLS = [
     "BTC-USDT",
     "ETH-USDT",
@@ -51,12 +42,10 @@ SYMBOLS = [
     "APT-USDT",
 ]
 
-# Таймфреймы
 HTF_TIMEFRAME = "4H"
 MTF_TIMEFRAME = "1H"
 ENTRY_TIMEFRAME = "15m"
 
-# Количество свечей для анализа
 CANDLE_LIMIT = 300
 
 
@@ -109,7 +98,7 @@ MIN_ATR_PERCENT = 0.0010
 # SIGNAL SCORE
 # ------------------------------------------------------------
 
-MIN_SIGNAL_SCORE = 68  # Порог скоринга под RR от 1.6
+MIN_SIGNAL_SCORE = 68
 
 SIGNAL_SCORE_WEIGHTS = {
     "htf_structure": 20,
@@ -123,20 +112,24 @@ SIGNAL_SCORE_WEIGHTS = {
 
 
 # ------------------------------------------------------------
-# RISK MANAGEMENT
+# RISK MANAGEMENT & LEVERAGE
 # ------------------------------------------------------------
 
 DEFAULT_RISK_PERCENT = 1.0
 MIN_RISK_PERCENT = 0.10
 MAX_RISK_PERCENT = 5.0
 
-# Минимальный RR для отправки сигнала (теперь от 1.6)
+# Кредитное плечо по умолчанию
+DEFAULT_LEVERAGE = 10
+MIN_LEVERAGE = 1
+MAX_LEVERAGE = 125
+
 MIN_RR = 1.60
 
 TP1_R_MULTIPLE = 1.0
 TP2_R_MULTIPLE = 2.0
 
-MAX_POSITION_BALANCE_MULTIPLE = 10.0
+MAX_POSITION_BALANCE_MULTIPLE = 50.0  # Увеличено для поддержки плеча
 
 
 # ------------------------------------------------------------

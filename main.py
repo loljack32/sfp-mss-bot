@@ -1,5 +1,5 @@
 # ============================================================
-# MAIN SCANNER PIPELINE (TOP 200 COINS)
+# MAIN SCANNER PIPELINE (TOP 200 COINS WITH DETAILED LOGS)
 # SFP + MSS BOT
 # ============================================================
 
@@ -116,34 +116,47 @@ def run_scanner() -> None:
     account_balance, risk_percent = load_user_settings()
     telegram = TelegramNotifier()
 
-    print("=" * 65)
+    print("=" * 70)
     print(f"Starting SFP + MSS Scanner at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
     print(f"Account Balance: ${account_balance:,.2f} | Risk per Trade: {risk_percent:.2f}%")
     print(f"HTF: {HTF_TIMEFRAME} | LTF: {ENTRY_TIMEFRAME}")
-    print("=" * 65)
+    print("=" * 70)
 
-    signals_found = 0
-    signals_sent = 0
+    # Статистика фильтрации
+    stats = {
+        "total_scanned": 0,
+        "skipped_htf": 0,
+        "no_sfp": 0,
+        "no_mss": 0,
+        "invalidated": 0,
+        "cooldown": 0,
+        "filter_rejected": 0,
+        "signals_generated": 0,
+        "signals_sent": 0,
+    }
 
     with OKXClient() as client:
-        # 1. Получаем список монет для сканирования (Топ-200 или резервный список)
+        # 1. Получаем список монет для сканирования
         if DYNAMIC_TOP_SYMBOLS:
-            print(f"Fetching Top {TOP_SYMBOLS_COUNT} spot symbols by 24h volume...")
+            print(f"\n[INFO] Fetching Top {TOP_SYMBOLS_COUNT} spot symbols by 24h volume from OKX...")
             try:
                 symbols_to_scan = client.get_top_volume_symbols(top_n=TOP_SYMBOLS_COUNT)
-                print(f"Loaded {len(symbols_to_scan)} liquid symbols from OKX.")
+                print(f"[INFO] Loaded {len(symbols_to_scan)} liquid symbols from OKX.\n")
             except Exception as exc:
-                print(f"[WARN] Failed to fetch top symbols, using fallback list: {exc}")
+                print(f"[WARN] Failed to fetch top symbols, using fallback list: {exc}\n")
                 symbols_to_scan = SYMBOLS
         else:
             symbols_to_scan = SYMBOLS
 
-        # 2. Основной цикл сканирования
         total = len(symbols_to_scan)
+        stats["total_scanned"] = total
+
+        # 2. Основной цикл сканирования
         for idx, symbol in enumerate(symbols_to_scan, 1):
+            tag = f"[{idx:03d}/{total:03d}] {symbol}"
+
             try:
-                # Пауза 50мс для защиты от rate-limit OKX при большом списке
-                time.sleep(0.05)
+                time.sleep(0.05)  # Защита от rate-limit OKX
 
                 df_htf = client.get_candles(
                     symbol=symbol,
@@ -159,8 +172,10 @@ def run_scanner() -> None:
                     closed_only=True,
                 )
             except OKXError as exc:
+                print(f"{tag} -> ❌ OKX Error: {exc}")
                 continue
-            except Exception:
+            except Exception as exc:
+                print(f"{tag} -> ❌ Data fetch error: {exc}")
                 continue
 
             # 3. Анализ структуры
@@ -168,28 +183,45 @@ def run_scanner() -> None:
             structure_ltf, _ = analyze_structure(df_ltf, htf=False)
 
             if htf_state.trend not in {"BULLISH", "BEARISH"}:
+                stats["skipped_htf"] += 1
+                print(f"{tag} -> ⏭ Skipped: HTF trend is {htf_state.trend} (no clear directional bias)")
                 continue
 
-            # 4. Поиск SFP и MSS
+            # 4. Поиск SFP
             sfps = find_sfps(df_ltf, structure_ltf)
             if not sfps:
+                stats["no_sfp"] += 1
+                print(f"{tag} -> ⏭ HTF: {htf_state.trend} | No valid SFP found on LTF")
                 continue
 
+            # 5. Поиск MSS
             result = find_latest_mss(df_ltf, sfps, structure_ltf)
             if result is None:
+                stats["no_mss"] += 1
+                latest_sfp = sfps[-1]
+                print(f"{tag} -> ⏭ HTF: {htf_state.trend} | SFP {latest_sfp.direction} found, but no confirmed MSS shift yet")
                 continue
 
             sfp, mss = result
 
-            # 5. Проверка инвалидации
-            if is_sfp_invalidated(df_ltf, sfp) or is_mss_invalidated(df_ltf, sfp, mss):
+            # 6. Проверка инвалидации
+            if is_sfp_invalidated(df_ltf, sfp):
+                stats["invalidated"] += 1
+                print(f"{tag} -> ⏭ Setup invalidated: SFP extreme breached")
                 continue
 
-            # 6. Проверка кулдауна
+            if is_mss_invalidated(df_ltf, sfp, mss):
+                stats["invalidated"] += 1
+                print(f"{tag} -> ⏭ Setup invalidated: MSS level breached")
+                continue
+
+            # 7. Проверка кулдауна
             if is_on_cooldown(symbol, sfp.direction, state):
+                stats["cooldown"] += 1
+                print(f"{tag} -> ⏭ Signal {sfp.direction} is on cooldown (already alerted recently)")
                 continue
 
-            # 7. Финальная фильтрация и расчёт риска
+            # 8. Финальная оценка через фильтры
             signal = generate_signal(
                 symbol=symbol,
                 timeframe=ENTRY_TIMEFRAME,
@@ -203,28 +235,52 @@ def run_scanner() -> None:
             )
 
             if signal is None:
+                stats["filter_rejected"] += 1
+                reasons = get_signal_failure_reasons(
+                    df=df_ltf,
+                    sfp=sfp,
+                    mss=mss,
+                    structure=structure_ltf,
+                    htf_state=htf_state,
+                )
+                reasons_str = "; ".join(reasons) if reasons else "Filters not met"
+                print(f"{tag} -> ⚠️ SFP+MSS found ({sfp.direction}), but REJECTED by filters: [{reasons_str}]")
                 continue
 
-            # 8. Отправка сигнала
-            signals_found += 1
-            print(f"\n🎯 [{idx}/{total}] VALID SIGNAL: {signal.symbol} {signal.direction} | Score: {signal.signal_score:.1f}")
+            # 9. Успешный сигнал
+            stats["signals_generated"] += 1
+            print(f"\n{'='*70}")
+            print(f"🎯 {tag} -> VALID SIGNAL: {signal.direction} | Score: {signal.signal_score:.1f} | Entry: {signal.entry} | SL: {signal.stop_loss}")
+            print(f"{'='*70}\n")
 
             if telegram.is_configured:
                 sent = telegram.send_signal(signal)
                 if sent:
-                    print(f"[{symbol}] Sent to Telegram successfully.")
+                    print(f"{tag} -> 📤 Sent to Telegram successfully.")
                     record_signal_sent(symbol, signal.direction, state)
-                    signals_sent += 1
+                    stats["signals_sent"] += 1
+                else:
+                    print(f"{tag} -> ❌ Failed to send Telegram message.")
             else:
+                print(f"{tag} -> ℹ️ Telegram not configured, recorded locally.")
                 record_signal_sent(symbol, signal.direction, state)
 
-        # Выводим компактный прогресс
-        print(f"\nCompleted scan of {total} coins.")
-
+    # Сохраняем состояние отправленных сигналов
     save_signal_state(state)
-    print("=" * 65)
-    print(f"Scan finished. Signals Found: {signals_found} | Signals Sent: {signals_sent}")
-    print("=" * 65)
+
+    # Итоговый отчёт
+    print("\n" + "=" * 70)
+    print("📊 SCAN SUMMARY REPORT:")
+    print(f"• Total coins scanned:         {stats['total_scanned']}")
+    print(f"• Skipped (HTF trend mixed):    {stats['skipped_htf']}")
+    print(f"• Skipped (No SFP pattern):    {stats['no_sfp']}")
+    print(f"• Skipped (SFP found, no MSS): {stats['no_mss']}")
+    print(f"• Skipped (Invalidated):       {stats['invalidated']}")
+    print(f"• Skipped (Cooldown active):   {stats['cooldown']}")
+    print(f"• Rejected by Quality Filters: {stats['filter_rejected']}")
+    print(f"• Valid Signals Generated:     {stats['signals_generated']}")
+    print(f"• Signals Sent to Telegram:    {stats['signals_sent']}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from config import (
     MIN_SIGNAL_SCORE,
     MIN_RR,
     SIGNAL_SCORE_WEIGHTS,
+    ENABLE_COUNTER_TREND_SIGNALS,
 )
 
 from core.sfp import (
@@ -45,7 +46,7 @@ class FilterResult:
     reasons: List[str]
     warnings: List[str]
     metrics: dict
-    setup_type: str  # "TREND" или "COUNTER_TREND"
+    setup_type: str
 
 
 # ============================================================
@@ -105,7 +106,9 @@ def calculate_atr_percent(
 def check_htf_alignment(
     direction: str,
     htf_state: StructureState,
-    allow_counter_trend: bool = False,
+    allow_counter_trend: bool = ENABLE_COUNTER_TREND_SIGNALS,
+    *args,
+    **kwargs,
 ) -> tuple[bool, str, str]:
     if htf_state.trend not in {"BULLISH", "BEARISH"}:
         return False, f"HTF structure is {htf_state.trend} (no clear trend)", "UNKNOWN"
@@ -339,7 +342,9 @@ def score_rr(rr: Optional[float]) -> float:
         return 90.0
     if rr >= 2.0:
         return 80.0
-    if rr >= 1.5:
+    if rr >= 1.6:
+        return 70.0
+    if rr >= 1.4:
         return 50.0
     return 0.0
 
@@ -383,146 +388,8 @@ def evaluate_setup(
     structure: List[SwingPoint],
     htf_state: StructureState,
     entry_price: Optional[float] = None,
-    allow_counter_trend: bool = False,
+    allow_counter_trend: bool = ENABLE_COUNTER_TREND_SIGNALS,
+    *args,
+    **kwargs,
 ) -> FilterResult:
-    reasons: List[str] = []
-    warnings: List[str] = []
-    metrics = {}
-
-    direction = sfp.direction
-
-    if entry_price is None:
-        entry_price = float(df.iloc[-1]["close"])
-    entry = float(entry_price)
-    metrics["entry"] = entry
-
-    htf_aligned, htf_reason, setup_type = check_htf_alignment(
-        direction=direction,
-        htf_state=htf_state,
-        allow_counter_trend=allow_counter_trend,
-    )
-
-    metrics["htf_trend"] = htf_state.trend
-    metrics["htf_aligned"] = htf_aligned
-    metrics["setup_type"] = setup_type
-
-    if not htf_aligned:
-        reasons.append(htf_reason)
-
-    local_structure_ok, structure_reason = check_local_structure(
-        direction=direction,
-        sfp=sfp,
-        mss=mss,
-        structure=structure,
-    )
-    metrics["local_structure_ok"] = local_structure_ok
-    if not local_structure_ok:
-        reasons.append(structure_reason)
-
-    atr = float(sfp.atr)
-    atr_percent = atr / entry if entry > 0 else 0
-    metrics["atr"] = atr
-    metrics["atr_percent"] = atr_percent
-
-    if atr_percent < MIN_ATR_PERCENT:
-        reasons.append("ATR volatility is too low")
-
-    volume_ratio = calculate_volume_ratio(df=df, index=mss.break_index)
-    metrics["volume_ratio"] = volume_ratio
-    if volume_ratio is None or volume_ratio < MIN_VOLUME_RATIO:
-        warnings.append("Volume confirmation is weak")
-
-    entry_distance_ok, entry_distance_reason = check_entry_distance_from_mss(
-        direction=direction,
-        entry=entry,
-        mss=mss,
-        atr=atr,
-    )
-    metrics["entry_distance_ok"] = entry_distance_ok
-    if not entry_distance_ok:
-        reasons.append(entry_distance_reason)
-
-    stop_loss = calculate_stop_loss(direction=direction, sfp=sfp, atr=atr)
-    metrics["stop_loss"] = stop_loss
-
-    if stop_loss is None:
-        reasons.append("Unable to calculate stop loss")
-    else:
-        if direction == "LONG" and stop_loss >= entry:
-            reasons.append("LONG stop loss is not below entry")
-        elif direction == "SHORT" and stop_loss <= entry:
-            reasons.append("SHORT stop loss is not above entry")
-
-    target = find_nearest_liquidity_target(
-        direction=direction,
-        current_index=mss.break_index,
-        current_price=entry,
-        structure=structure,
-    )
-
-    metrics["liquidity_target"] = target.price if target is not None else None
-    metrics["liquidity_target_label"] = target.label if target is not None else None
-
-    if target is None:
-        reasons.append("No valid liquidity target above/below entry")
-
-    rr = None
-    if stop_loss is not None and target is not None:
-        rr = calculate_rr(
-            direction=direction,
-            entry=entry,
-            stop_loss=stop_loss,
-            target=target.price,
-        )
-
-    metrics["rr_to_liquidity"] = rr
-
-    if rr is None:
-        reasons.append("Unable to calculate RR")
-    elif rr < MIN_RR:
-        reasons.append(f"RR is below minimum {MIN_RR:.2f}")
-
-    htf_component = score_htf(setup_type)
-    liquidity_component = score_liquidity(target)
-    sfp_component = score_sfp(sfp)
-    mss_component = score_mss(mss)
-    displacement_component = score_displacement(mss)
-    volume_component = score_volume(volume_ratio)
-    rr_component = score_rr(rr)
-
-    final_score = calculate_signal_score(
-        htf_score=htf_component,
-        liquidity_score=liquidity_component,
-        sfp_score=sfp_component,
-        mss_score=mss_component,
-        displacement_score=displacement_component,
-        volume_score=volume_component,
-        rr_score=rr_component,
-    )
-
-    metrics["final_score"] = final_score
-
-    if final_score < MIN_SIGNAL_SCORE:
-        reasons.append(f"Signal score {final_score:.1f} is below minimum {MIN_SIGNAL_SCORE:.1f}")
-
-    passed = len(reasons) == 0
-
-    return FilterResult(
-        passed=passed,
-        score=final_score,
-        reasons=reasons,
-        warnings=warnings,
-        metrics=metrics,
-        setup_type=setup_type,
-    )
-
-
-def filter_result_to_dict(result: FilterResult) -> dict:
-    return {
-        "passed": result.passed,
-        "score": result.score,
-        "reasons": result.reasons,
-        "warnings": result.warnings,
-        "metrics": result.metrics,
-        "setup_type": result.setup_type,
-    }
+    r

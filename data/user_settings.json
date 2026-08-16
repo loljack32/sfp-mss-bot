@@ -1,4 +1,5 @@
 {
   "balance": 40,
-  "risk_percent": 3
+  "risk_percent": 3,
+  "leverage": 5
 }

@@ -109,7 +109,7 @@ MIN_ATR_PERCENT = 0.0010
 # SIGNAL SCORE
 # ------------------------------------------------------------
 
-MIN_SIGNAL_SCORE = 70  # Скорректирован для качественного прохождения контртрендовых сигналов
+MIN_SIGNAL_SCORE = 68  # Порог скоринга под RR от 1.6
 
 SIGNAL_SCORE_WEIGHTS = {
     "htf_structure": 20,
@@ -129,7 +129,9 @@ SIGNAL_SCORE_WEIGHTS = {
 DEFAULT_RISK_PERCENT = 1.0
 MIN_RISK_PERCENT = 0.10
 MAX_RISK_PERCENT = 5.0
-MIN_RR = 2.0
+
+# Минимальный RR для отправки сигнала (теперь от 1.6)
+MIN_RR = 1.60
 
 TP1_R_MULTIPLE = 1.0
 TP2_R_MULTIPLE = 2.0

@@ -24,7 +24,7 @@ from core.signals import TradingSignal
 
 def format_signal_message(signal: TradingSignal) -> str:
     """
-    Формирует HTML-сообщение для Telegram.
+    Формирует красивое HTML-сообщение для Telegram с указанием тактики.
     """
     is_long = signal.direction == "LONG"
     direction_icon = "🟢" if is_long else "🔴"
@@ -36,6 +36,13 @@ def format_signal_message(signal: TradingSignal) -> str:
         else "⚖️"
     )
 
+    if signal.setup_type == "TREND":
+        tactic_badge = "🎯 <b>Тактика:</b> <code>SFP + MSS (По тренду 4H)</code>"
+        header_title = f"{direction_icon} <b>NEW SIGNAL: {signal.symbol} | {signal.direction}</b>"
+    else:
+        tactic_badge = "⚡️ <b>Тактика:</b> <code>SFP + MSS (Контртренд / Откат 4H ⚠️)</code>"
+        header_title = f"⚡️ <b>NEW SIGNAL: {signal.symbol} | {signal.direction} [PULLBACK]</b>"
+
     def fmt_price(price: float) -> str:
         if price >= 100:
             return f"{price:,.2f}"
@@ -44,7 +51,8 @@ def format_signal_message(signal: TradingSignal) -> str:
         return f"{price:,.6f}"
 
     lines = [
-        f"{direction_icon} <b>NEW SIGNAL: {signal.symbol} | {signal.direction}</b>",
+        header_title,
+        tactic_badge,
         f"⏱ <b>Timeframe:</b> <code>{signal.timeframe}</code>",
         f"⭐ <b>Signal Score:</b> <code>{signal.signal_score:.1f} / 100</code>",
         "",
@@ -88,10 +96,6 @@ def format_signal_message(signal: TradingSignal) -> str:
 # ============================================================
 
 class TelegramNotifier:
-    """
-    Клиент для отправки сообщений через Telegram Bot API.
-    """
-
     def __init__(
         self,
         bot_token: Optional[str] = None,
@@ -117,9 +121,6 @@ class TelegramNotifier:
         parse_mode: str = "HTML",
         disable_web_page_preview: bool = True,
     ) -> bool:
-        """
-        Отправляет текстовое сообщение в Telegram.
-        """
         if not self.is_configured:
             print("[WARN] Telegram is not configured. Skipping notification.")
             return False
@@ -133,11 +134,7 @@ class TelegramNotifier:
         }
 
         try:
-            response = requests.post(
-                url,
-                json=payload,
-                timeout=self.timeout,
-            )
+            response = requests.post(url, json=payload, timeout=self.timeout)
             data = response.json()
             if not data.get("ok"):
                 print(f"[ERROR] Telegram API error: {data.get('description')}")
@@ -148,16 +145,9 @@ class TelegramNotifier:
             return False
 
     def send_signal(self, signal: TradingSignal) -> bool:
-        """
-        Форматирует и отправляет торговый сигнал.
-        """
         message = format_signal_message(signal)
         return self.send_message(message)
 
-
-# ============================================================
-# CONVENIENCE FUNCTION
-# ============================================================
 
 def send_signal(signal: TradingSignal) -> bool:
     notifier = TelegramNotifier()

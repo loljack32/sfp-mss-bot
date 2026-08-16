@@ -1,5 +1,5 @@
 # ============================================================
-# MAIN SCANNER PIPELINE (TREND + COUNTER-TREND SUPPORT)
+# MAIN SCANNER PIPELINE (FULL FUTURES SUPPORT WITH LEVERAGE)
 # SFP + MSS BOT
 # ============================================================
 
@@ -23,6 +23,7 @@ from config import (
     DATA_DIR,
     SIGNAL_STATE_FILE,
     DEFAULT_RISK_PERCENT,
+    DEFAULT_LEVERAGE,
     SIGNAL_COOLDOWN_MINUTES,
     ENABLE_COUNTER_TREND_SIGNALS,
 )
@@ -42,20 +43,24 @@ from core.telegram import TelegramNotifier
 USER_SETTINGS_FILE = "data/user_settings.json"
 
 
-def load_user_settings(filepath: str = USER_SETTINGS_FILE) -> Tuple[float, float]:
+def load_user_settings(filepath: str = USER_SETTINGS_FILE) -> Tuple[float, float, int]:
+    """
+    Загружает: (баланс, процент риска, кредитное плечо).
+    """
     path = Path(filepath)
     if not path.exists():
-        return 10000.0, float(DEFAULT_RISK_PERCENT)
+        return 10000.0, float(DEFAULT_RISK_PERCENT), int(DEFAULT_LEVERAGE)
 
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
             balance = float(data.get("balance", 10000.0))
             risk = float(data.get("risk_percent", DEFAULT_RISK_PERCENT))
-            return balance, risk
+            leverage = int(data.get("leverage", DEFAULT_LEVERAGE))
+            return balance, risk, leverage
     except Exception as exc:
         print(f"[WARN] Failed to read user settings: {exc}")
-        return 10000.0, float(DEFAULT_RISK_PERCENT)
+        return 10000.0, float(DEFAULT_RISK_PERCENT), int(DEFAULT_LEVERAGE)
 
 
 def load_signal_state(filepath: str = SIGNAL_STATE_FILE) -> Dict[str, str]:
@@ -114,13 +119,13 @@ def record_signal_sent(symbol: str, direction: str, state: Dict[str, str]) -> No
 def run_scanner() -> None:
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     state = load_signal_state()
-    account_balance, risk_percent = load_user_settings()
+    account_balance, risk_percent, leverage = load_user_settings()
     telegram = TelegramNotifier()
 
     print("=" * 70)
     print(f"Starting SFP + MSS Scanner at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    print(f"Account Balance: ${account_balance:,.2f} | Risk per Trade: {risk_percent:.2f}%")
-    print(f"HTF: {HTF_TIMEFRAME} | LTF: {ENTRY_TIMEFRAME} | Counter-Trend Allowed: {ENABLE_COUNTER_TREND_SIGNALS}")
+    print(f"Balance: ${account_balance:,.2f} | Risk: {risk_percent:.2f}% | Leverage: {leverage}x")
+    print(f"HTF: {HTF_TIMEFRAME} | LTF: {ENTRY_TIMEFRAME} | Counter-Trend: {ENABLE_COUNTER_TREND_SIGNALS}")
     print("=" * 70)
 
     stats = {
@@ -220,7 +225,7 @@ def run_scanner() -> None:
                 print(f"{tag} -> ⏭ Signal {sfp.direction} is on cooldown")
                 continue
 
-            # Фильтрация и генерация (с поддержкой контртренда)
+            # Фильтрация и генерация сигнала с учётом плеча
             signal = generate_signal(
                 symbol=symbol,
                 timeframe=ENTRY_TIMEFRAME,
@@ -231,7 +236,7 @@ def run_scanner() -> None:
                 htf_state=htf_state,
                 balance=account_balance,
                 risk_percent=risk_percent,
-                allow_counter_trend=ENABLE_COUNTER_TREND_SIGNALS,
+                leverage=leverage,
             )
 
             if signal is None:
@@ -242,14 +247,14 @@ def run_scanner() -> None:
                     mss=mss,
                     structure=structure_ltf,
                     htf_state=htf_state,
-                    allow_counter_trend=ENABLE_COUNTER_TREND_SIGNALS,
                 )
                 reasons_str = "; ".join(reasons) if reasons else "Filters not met"
                 print(f"{tag} -> ⚠️ SFP+MSS ({sfp.direction}), REJECTED by filters: [{reasons_str}]")
                 continue
 
-            # Сигнал готов
-            if signal.setup_type == "TREND":
+            # Сигнал сформирован
+            setup_type = getattr(signal, "setup_type", "TREND")
+            if setup_type == "TREND":
                 stats["signals_trend"] += 1
                 icon = "🎯 [TREND]"
             else:
@@ -257,7 +262,7 @@ def run_scanner() -> None:
                 icon = "⚡️ [PULLBACK/COUNTER-TREND]"
 
             print(f"\n{'='*70}")
-            print(f"{icon} {tag} -> VALID SIGNAL: {signal.direction} | Score: {signal.signal_score:.1f} | Entry: {signal.entry} | SL: {signal.stop_loss}")
+            print(f"{icon} {tag} -> VALID SIGNAL: {signal.direction} | Score: {signal.signal_score:.1f} | Entry: {signal.entry} | Margin: ${signal.margin_required:.2f}")
             print(f"{'='*70}\n")
 
             if telegram.is_configured:

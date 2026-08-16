@@ -40,10 +40,6 @@ from core.structure import (
 
 @dataclass(frozen=True)
 class FilterResult:
-    """
-    Результат проверки качества сетапа.
-    """
-
     passed: bool
     score: float
     reasons: List[str]
@@ -111,9 +107,6 @@ def check_htf_alignment(
     htf_state: StructureState,
     allow_counter_trend: bool = False,
 ) -> tuple[bool, str, str]:
-    """
-    Возвращает: (пройдено ли, причина/описание, тип сетапа ["TREND" | "COUNTER_TREND"])
-    """
     if htf_state.trend not in {"BULLISH", "BEARISH"}:
         return False, f"HTF structure is {htf_state.trend} (no clear trend)", "UNKNOWN"
 
@@ -398,13 +391,11 @@ def evaluate_setup(
 
     direction = sfp.direction
 
-    # Entry
     if entry_price is None:
         entry_price = float(df.iloc[-1]["close"])
     entry = float(entry_price)
     metrics["entry"] = entry
 
-    # HTF
     htf_aligned, htf_reason, setup_type = check_htf_alignment(
         direction=direction,
         htf_state=htf_state,
@@ -418,7 +409,6 @@ def evaluate_setup(
     if not htf_aligned:
         reasons.append(htf_reason)
 
-    # Local Structure
     local_structure_ok, structure_reason = check_local_structure(
         direction=direction,
         sfp=sfp,
@@ -429,7 +419,6 @@ def evaluate_setup(
     if not local_structure_ok:
         reasons.append(structure_reason)
 
-    # ATR
     atr = float(sfp.atr)
     atr_percent = atr / entry if entry > 0 else 0
     metrics["atr"] = atr
@@ -438,13 +427,11 @@ def evaluate_setup(
     if atr_percent < MIN_ATR_PERCENT:
         reasons.append("ATR volatility is too low")
 
-    # Volume
     volume_ratio = calculate_volume_ratio(df=df, index=mss.break_index)
     metrics["volume_ratio"] = volume_ratio
     if volume_ratio is None or volume_ratio < MIN_VOLUME_RATIO:
         warnings.append("Volume confirmation is weak")
 
-    # Entry Distance
     entry_distance_ok, entry_distance_reason = check_entry_distance_from_mss(
         direction=direction,
         entry=entry,
@@ -455,7 +442,6 @@ def evaluate_setup(
     if not entry_distance_ok:
         reasons.append(entry_distance_reason)
 
-    # Stop Loss
     stop_loss = calculate_stop_loss(direction=direction, sfp=sfp, atr=atr)
     metrics["stop_loss"] = stop_loss
 
@@ -467,7 +453,6 @@ def evaluate_setup(
         elif direction == "SHORT" and stop_loss <= entry:
             reasons.append("SHORT stop loss is not above entry")
 
-    # Target & RR
     target = find_nearest_liquidity_target(
         direction=direction,
         current_index=mss.break_index,
@@ -497,7 +482,6 @@ def evaluate_setup(
     elif rr < MIN_RR:
         reasons.append(f"RR is below minimum {MIN_RR:.2f}")
 
-    # Scores
     htf_component = score_htf(setup_type)
     liquidity_component = score_liquidity(target)
     sfp_component = score_sfp(sfp)

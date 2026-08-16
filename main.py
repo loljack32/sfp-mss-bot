@@ -10,7 +10,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 from config import (
     SYMBOLS,
@@ -32,8 +32,31 @@ from core.telegram import TelegramNotifier
 
 
 # ============================================================
-# STATE / COOLDOWN MANAGEMENT
+# SETTINGS & STATE MANAGEMENT
 # ============================================================
+
+USER_SETTINGS_FILE = "data/user_settings.json"
+
+
+def load_user_settings(filepath: str = USER_SETTINGS_FILE) -> Tuple[float, float]:
+    """
+    Загружает пользовательский баланс и процент риска из Telegram.
+    Если файла нет, возвращаются значения по умолчанию.
+    """
+    path = Path(filepath)
+    if not path.exists():
+        return 10000.0, float(DEFAULT_RISK_PERCENT)
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            balance = float(data.get("balance", 10000.0))
+            risk = float(data.get("risk_percent", DEFAULT_RISK_PERCENT))
+            return balance, risk
+    except Exception as exc:
+        print(f"[WARN] Failed to read user settings from {filepath}: {exc}")
+        return 10000.0, float(DEFAULT_RISK_PERCENT)
+
 
 def load_signal_state(filepath: str = SIGNAL_STATE_FILE) -> Dict[str, str]:
     """
@@ -113,12 +136,13 @@ def run_scanner() -> None:
 
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
     state = load_signal_state()
+    account_balance, risk_percent = load_user_settings()
+
+    print(f"[CONFIG] Active Balance: ${account_balance:,.2f} | Active Risk: {risk_percent:.2f}%")
 
     telegram = TelegramNotifier()
     signals_found = 0
     signals_sent = 0
-
-    account_balance = 10000.0
 
     with OKXClient() as client:
         for symbol in SYMBOLS:
@@ -181,7 +205,7 @@ def run_scanner() -> None:
                 print(f"[{symbol}] Signal {sfp.direction} is on cooldown. Skipping.")
                 continue
 
-            # 8. Генерируем торговый сигнал со всеми фильтрами и риск-менеджментом
+            # 8. Генерируем торговый сигнал с пользовательским балансом и риском
             signal = generate_signal(
                 symbol=symbol,
                 timeframe=ENTRY_TIMEFRAME,
@@ -191,7 +215,7 @@ def run_scanner() -> None:
                 structure=structure_ltf,
                 htf_state=htf_state,
                 balance=account_balance,
-                risk_percent=DEFAULT_RISK_PERCENT,
+                risk_percent=risk_percent,
             )
 
             if signal is None:

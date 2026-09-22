@@ -33,6 +33,7 @@ from core.structure import analyze_structure
 from core.sfp import find_sfps, is_sfp_invalidated
 from core.mss import find_latest_mss, is_mss_invalidated
 from core.signals import generate_signal, get_signal_failure_reasons
+from core.filters import evaluate_setup
 from core.telegram import TelegramNotifier
 
 
@@ -241,6 +242,112 @@ def run_scanner() -> None:
                 for reason in failure_reasons:
                     stats["filter_reasons"][reason] = (
                         stats["filter_reasons"].get(reason, 0) + 1
+                    )
+
+                # ========================================================
+                # DETAILED CANDIDATE DIAGNOSTICS
+                # ========================================================
+                try:
+                    debug_result = evaluate_setup(
+                        df=df_ltf,
+                        sfp=sfp,
+                        mss=mss,
+                        structure=structure_ltf,
+                        htf_state=htf_state,
+                        entry_price=float(df_ltf["close"].iloc[-1]),
+                        allow_counter_trend=ENABLE_COUNTER_TREND_SIGNALS,
+                    )
+
+                    metrics = getattr(debug_result, "metrics", {}) or {}
+
+                    entry = metrics.get("entry")
+                    stop = metrics.get("stop_loss")
+                    liquidity_target = metrics.get("liquidity_target")
+                    liquidity_label = metrics.get("liquidity_target_label")
+
+                    print(f"\\n[REJECTED CANDIDATE] {symbol} | {sfp.direction}")
+                    print(
+                        f"  Entry:             "
+                        f"{entry if entry is not None else 'N/A'}"
+                    )
+                    print(
+                        f"  Stop Loss:         "
+                        f"{stop if stop is not None else 'N/A'}"
+                    )
+                    print(
+                        f"  Liquidity Target:  "
+                        f"{liquidity_target if liquidity_target is not None else 'N/A'}"
+                        f" ({liquidity_label or 'N/A'})"
+                    )
+
+                    if entry is not None and stop is not None:
+                        risk_distance = abs(float(entry) - float(stop))
+
+                        print(
+                            f"  Risk distance:     "
+                            f"{risk_distance:.8g}"
+                        )
+
+                        if liquidity_target is not None and risk_distance > 0:
+                            liquidity_rr = (
+                                abs(float(liquidity_target) - float(entry))
+                                / risk_distance
+                            )
+                            print(
+                                f"  Liquidity RR:      "
+                                f"{liquidity_rr:.2f}R"
+                            )
+                            required_liquidity_rr = max(1.60, 2.00)
+                            print(
+                                f"  Minimum Liquidity RR: "
+                                f"{required_liquidity_rr:.2f}R"
+                            )
+                            print(
+                                f"  RR Margin:         "
+                                f"{liquidity_rr - required_liquidity_rr:+.2f}R"
+                            )
+
+                            tp1 = (
+                                float(entry) + 2.0 * risk_distance
+                                if sfp.direction.upper() == "LONG"
+                                else float(entry) - 2.0 * risk_distance
+                            )
+                            tp2 = (
+                                float(entry) + 3.0 * risk_distance
+                                if sfp.direction.upper() == "LONG"
+                                else float(entry) - 3.0 * risk_distance
+                            )
+
+                            print(f"  TP1 (2R):          {tp1:.8g}")
+                            print(f"  TP2 (3R):          {tp2:.8g}")
+                            print(f"  TP1 RR:            2.00R")
+                            print(f"  TP2 RR:            3.00R")
+
+                    print(
+                        f"  SFP:               "
+                        f"{getattr(sfp, 'direction', 'N/A')}"
+                    )
+                    print(
+                        f"  MSS:               "
+                        f"{getattr(mss, 'direction', 'N/A')}"
+                    )
+                    print(
+                        f"  Score:             "
+                        f"{getattr(debug_result, 'score', 'N/A')}"
+                    )
+                    print(
+                        f"  Passed:            "
+                        f"{getattr(debug_result, 'passed', 'N/A')}"
+                    )
+                    print(
+                        f"  Reasons:           "
+                        f"{' | '.join(failure_reasons)}"
+                    )
+
+                except Exception as debug_exc:
+                    print(
+                        f"[DEBUG ERROR] {symbol}: "
+                        f"{type(debug_exc).__name__}: {debug_exc}"
                     )
 
                 continue

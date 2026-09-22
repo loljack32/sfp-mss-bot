@@ -16,6 +16,7 @@ from config import (
     VOLUME_LOOKBACK,
     MIN_SIGNAL_SCORE,
     MIN_RR,
+    TP1_R_MULTIPLE,
     SIGNAL_SCORE_WEIGHTS,
     ENABLE_COUNTER_TREND_SIGNALS,
 )
@@ -207,6 +208,8 @@ def find_nearest_liquidity_target(
     current_index: int,
     current_price: float,
     structure: List[SwingPoint],
+    stop_loss: Optional[float] = None,
+    min_rr: float = MIN_RR,
 ) -> Optional[SwingPoint]:
     targets = get_liquidity_targets(
         direction=direction,
@@ -214,9 +217,35 @@ def find_nearest_liquidity_target(
         structure=structure,
         current_price=current_price,
     )
+
     if not targets:
         return None
-    return targets[0]
+
+    # Without a valid stop we cannot determine whether a liquidity
+    # level provides an acceptable risk/reward ratio.
+    if stop_loss is None:
+        return targets[0]
+
+    # The liquidity target must not sit before TP1.
+    # TP1 is currently 2R, while MIN_RR is 1.60R.
+    # Therefore the effective minimum target RR is the larger
+    # of MIN_RR and TP1_R_MULTIPLE.
+    required_rr = max(min_rr, TP1_R_MULTIPLE)
+
+    # Targets are already sorted from nearest to farthest.
+    # Select the nearest liquidity level that supports TP1.
+    for target in targets:
+        rr = calculate_rr(
+            direction=direction,
+            entry=current_price,
+            stop_loss=stop_loss,
+            target=target.price,
+        )
+
+        if rr is not None and rr >= required_rr:
+            return target
+
+    return None
 
 
 # ============================================================
@@ -469,6 +498,8 @@ def evaluate_setup(
         current_index=mss.break_index,
         current_price=entry,
         structure=structure,
+        stop_loss=stop_loss,
+        min_rr=MIN_RR,
     )
 
     metrics["liquidity_target"] = target.price if target is not None else None

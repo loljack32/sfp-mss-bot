@@ -32,7 +32,7 @@ from core.okx import OKXClient, OKXError
 from core.structure import analyze_structure
 from core.sfp import find_sfps, is_sfp_invalidated
 from core.mss import find_latest_mss, is_mss_invalidated
-from core.signals import generate_signal
+from core.signals import generate_signal, get_signal_failure_reasons
 from core.telegram import TelegramNotifier
 
 
@@ -134,6 +134,7 @@ def run_scanner() -> None:
         "invalidated": 0,
         "cooldown": 0,
         "filter_rejected": 0,
+        "filter_reasons": {},
         "signals_trend": 0,
         "signals_counter_trend": 0,
         "signals_sent": 0,
@@ -220,9 +221,31 @@ def run_scanner() -> None:
 
             if signal is None:
                 stats["filter_rejected"] += 1
+
+                # Получаем конкретные причины, почему кандидат был отклонён.
+                try:
+                    failure_reasons = get_signal_failure_reasons(
+                        df=df_ltf,
+                        sfp=sfp,
+                        mss=mss,
+                        structure=structure_ltf,
+                        htf_state=htf_state,
+                        allow_counter_trend=ENABLE_COUNTER_TREND_SIGNALS,
+                    )
+                except Exception as exc:
+                    failure_reasons = [f"DIAGNOSTIC_ERROR: {exc}"]
+
+                if not failure_reasons:
+                    failure_reasons = ["Unknown filter rejection"]
+
+                for reason in failure_reasons:
+                    stats["filter_reasons"][reason] = (
+                        stats["filter_reasons"].get(reason, 0) + 1
+                    )
+
                 continue
 
-            # Вывод ТОЛЬКО найденного сигнала
+            # Вывод найденного сигнала
             setup_type = getattr(signal, "setup_type", "TREND")
             if setup_type == "TREND":
                 stats["signals_trend"] += 1
@@ -232,7 +255,15 @@ def run_scanner() -> None:
                 badge = "⚡️ [PULLBACK]"
 
             print(f"\n{'-'*65}")
-            print(f"{badge} {signal.symbol} {signal.direction} | Score: {signal.signal_score:.1f} | Entry: {signal.entry} | SL: {signal.stop_loss} | Margin: ${signal.margin_required:.2f}")
+            print(
+                f"{badge} {signal.symbol} {signal.direction} | "
+                f"Score: {signal.signal_score:.1f} | "
+                f"Entry: {signal.entry} | "
+                f"SL: {signal.stop_loss} | "
+                f"TP1: {signal.tp1} ({signal.rr_tp1:.2f}R) | "
+                f"TP2: {signal.tp2} ({signal.rr_tp2:.2f}R) | "
+                f"Margin: ${signal.margin_required:.2f}"
+            )
             print(f"{'-'*65}\n")
 
             if telegram.is_configured:
@@ -249,7 +280,32 @@ def run_scanner() -> None:
     save_signal_state(state)
 
     print("\n" + "=" * 65)
-    print(f"Scan finished. Signals Found: {stats['signals_trend'] + stats['signals_counter_trend']} | Sent: {stats['signals_sent']}")
+    print("SCAN DIAGNOSTICS")
+    print("=" * 65)
+
+    total_signals = stats["signals_trend"] + stats["signals_counter_trend"]
+
+    print(f"Total symbols scanned:      {stats['total_scanned']}")
+    print(f"Rejected: HTF:              {stats['skipped_htf']}")
+    print(f"Rejected: No SFP:            {stats['no_sfp']}")
+    print(f"Rejected: No MSS:            {stats['no_mss']}")
+    print(f"Rejected: Invalidated:       {stats['invalidated']}")
+    print(f"Rejected: Cooldown:          {stats['cooldown']}")
+    print(f"Rejected: Filters:           {stats['filter_rejected']}")
+    print(f"Trend signals:               {stats['signals_trend']}")
+    print(f"Counter-trend signals:       {stats['signals_counter_trend']}")
+    print(f"Signals found:               {total_signals}")
+    print(f"Signals sent:                {stats['signals_sent']}")
+
+    if stats["filter_reasons"]:
+        print("\nFILTER REJECTION REASONS:")
+        for reason, count in sorted(
+            stats["filter_reasons"].items(),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            print(f"  {count:4d}x  {reason}")
+
     print("=" * 65)
 
 

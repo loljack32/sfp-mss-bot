@@ -194,6 +194,18 @@ def build_signal(
         tp2_rr=TP2_R_MULTIPLE,
     )
 
+    # Жёсткие минимальные требования к RR.
+    # TP1 должен быть минимум 1.5R, TP2 минимум 2.0R.
+    if risk.rr_tp1 < 1.50:
+        raise ValueError(
+            f"TP1 RR {risk.rr_tp1:.2f} is below minimum 1.50R."
+        )
+
+    if risk.rr_tp2 < 2.00:
+        raise ValueError(
+            f"TP2 RR {risk.rr_tp2:.2f} is below minimum 2.00R."
+        )
+
     validate_position_notional(
         balance=balance,
         position_notional=risk.position_notional,
@@ -371,8 +383,8 @@ def signal_to_text(signal: TradingSignal) -> str:
         f"Score: {signal.signal_score:.1f}",
         f"Entry: {signal.entry:.8f}",
         f"SL: {signal.stop_loss:.8f}",
-        f"TP1: {signal.tp1:.8f} (1R / RR {signal.rr_tp1:.2f})",
-        f"TP2: {signal.tp2:.8f} (2R / RR {signal.rr_tp2:.2f})",
+        f"TP1: {signal.tp1:.8f} ({signal.rr_tp1:.2f}R / RR {signal.rr_tp1:.2f})",
+        f"TP2: {signal.tp2:.8f} ({signal.rr_tp2:.2f}R / RR {signal.rr_tp2:.2f})",
         f"Плечо: {signal.leverage}x | Маржа: ${signal.margin_required:.2f}",
         f"Номинал: ${signal.position_notional:.2f} ({signal.position_size:.6f})",
         f"Риск: {signal.risk_percent:.2f}% (${signal.risk_amount:.2f})",

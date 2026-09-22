@@ -124,8 +124,14 @@ DEFAULT_LEVERAGE = 10
 MIN_LEVERAGE = 1
 MAX_LEVERAGE = 125
 
+# Минимально допустимый RR до ликвидности
 MIN_RR = 1.60
 
+# Минимальные RR целей
+MIN_TP1_R_MULTIPLE = 1.50
+MIN_TP2_R_MULTIPLE = 2.00
+
+# Фактические цели
 TP1_R_MULTIPLE = 2.0
 TP2_R_MULTIPLE = 3.0
 

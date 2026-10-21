@@ -9,9 +9,9 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from config import (
     SYMBOLS,
@@ -25,10 +25,11 @@ from config import (
     DEFAULT_RISK_PERCENT,
     DEFAULT_LEVERAGE,
     SIGNAL_COOLDOWN_MINUTES,
+    SIGNAL_DEDUPE_RETENTION_DAYS,
     ENABLE_COUNTER_TREND_SIGNALS,
 )
 
-from core.okx import OKXClient, OKXError
+from core.okx import OKXClient, OKXError, normalize_instrument_id
 from core.structure import analyze_structure
 from core.sfp import find_sfps, is_sfp_invalidated
 from core.mss import find_latest_mss, is_mss_invalidated
@@ -86,12 +87,33 @@ def save_signal_state(state: Dict[str, str], filepath: str = SIGNAL_STATE_FILE) 
         print(f"[ERROR] Failed to save state file: {exc}")
 
 
+def setup_fingerprint(symbol: str, sfp, mss) -> str:
+    """
+    Уникальный отпечаток конкретного сетапа SFP+MSS.
+
+    Один и тот же сетап нельзя отправлять дважды, даже если
+    кулдаун по символу давно истёк.
+    """
+    return (
+        f"{symbol}_{sfp.direction}"
+        f"_SFP:{sfp.sweep_timestamp.isoformat()}@{sfp.level:.10g}"
+        f"_MSS:{mss.break_timestamp.isoformat()}@{mss.structure_level:.10g}"
+    )
+
+
 def is_on_cooldown(
     symbol: str,
     direction: str,
     state: Dict[str, str],
     cooldown_minutes: int = SIGNAL_COOLDOWN_MINUTES,
+    sfp=None,
+    mss=None,
 ) -> bool:
+    # Конкретный сетап уже отправлялся - повторно не шлём никогда.
+    if sfp is not None and mss is not None:
+        if setup_fingerprint(symbol, sfp, mss) in state:
+            return True
+
     key = f"{symbol}_{direction}"
     last_sent_str = state.get(key)
     if not last_sent_str:
@@ -106,9 +128,39 @@ def is_on_cooldown(
         return False
 
 
-def record_signal_sent(symbol: str, direction: str, state: Dict[str, str]) -> None:
-    key = f"{symbol}_{direction}"
-    state[key] = datetime.now(timezone.utc).isoformat()
+def record_signal_sent(
+    symbol: str,
+    direction: str,
+    state: Dict[str, str],
+    sfp=None,
+    mss=None,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    state[f"{symbol}_{direction}"] = now
+
+    if sfp is not None and mss is not None:
+        state[setup_fingerprint(symbol, sfp, mss)] = now
+
+
+def prune_signal_state(
+    state: Dict[str, str],
+    retention_days: int = SIGNAL_DEDUPE_RETENTION_DAYS,
+) -> Dict[str, str]:
+    """Удаляет записи старше retention_days, чтобы стейт не рос вечно."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    pruned: Dict[str, str] = {}
+
+    for key, value in state.items():
+        try:
+            ts = datetime.fromisoformat(value)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts >= cutoff:
+                pruned[key] = value
+        except Exception:
+            continue
+
+    return pruned
 
 
 # ============================================================
@@ -146,9 +198,13 @@ def run_scanner() -> None:
             try:
                 symbols_to_scan = client.get_top_volume_symbols(top_n=TOP_SYMBOLS_COUNT)
             except Exception:
-                symbols_to_scan = SYMBOLS
+                symbols_to_scan = [
+                    normalize_instrument_id(s) for s in SYMBOLS
+                ]
         else:
-            symbols_to_scan = SYMBOLS
+            symbols_to_scan = [
+                normalize_instrument_id(s) for s in SYMBOLS
+            ]
 
         total = len(symbols_to_scan)
         stats["total_scanned"] = total
@@ -201,8 +257,8 @@ def run_scanner() -> None:
                 stats["invalidated"] += 1
                 continue
 
-            # Проверка кулдауна
-            if is_on_cooldown(symbol, sfp.direction, state):
+            # Проверка кулдауна (включая дедупликацию конкретного сетапа)
+            if is_on_cooldown(symbol, sfp.direction, state, sfp=sfp, mss=mss):
                 stats["cooldown"] += 1
                 continue
 
@@ -377,14 +433,26 @@ def run_scanner() -> None:
                 sent = telegram.send_signal(signal)
                 if sent:
                     print(f"[{signal.symbol}] -> Successfully sent to Telegram.")
-                    record_signal_sent(symbol, signal.direction, state)
+                    record_signal_sent(
+                        symbol,
+                        signal.direction,
+                        state,
+                        sfp=signal.sfp,
+                        mss=signal.mss,
+                    )
                     stats["signals_sent"] += 1
                 else:
                     print(f"[{signal.symbol}] -> Failed to send Telegram message.")
             else:
-                record_signal_sent(symbol, signal.direction, state)
+                record_signal_sent(
+                    symbol,
+                    signal.direction,
+                    state,
+                    sfp=signal.sfp,
+                    mss=signal.mss,
+                )
 
-    save_signal_state(state)
+    save_signal_state(prune_signal_state(state))
 
     print("\n" + "=" * 65)
     print("SCAN DIAGNOSTICS")

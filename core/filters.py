@@ -14,9 +14,21 @@ from config import (
     MIN_ATR_PERCENT,
     MIN_VOLUME_RATIO,
     VOLUME_LOOKBACK,
+    REQUIRE_VOLUME_CONFIRMATION,
     MIN_SIGNAL_SCORE,
+    MIN_SFP_SCORE,
+    MIN_MSS_SCORE,
+    COUNTER_TREND_MIN_SIGNAL_SCORE,
+    MAX_SIGNAL_AGE_BARS,
+    MAX_ENTRY_DISTANCE_ATR,
+    MAX_STOP_DISTANCE_ATR,
+    MAX_STOP_DISTANCE_PERCENT,
+    LIQUIDITY_SWING_LEFT,
+    LIQUIDITY_SWING_RIGHT,
     MIN_RR,
     TP1_R_MULTIPLE,
+    TP2_R_MULTIPLE,
+    MIN_TP2_R_MULTIPLE,
     SIGNAL_SCORE_WEIGHTS,
     ENABLE_COUNTER_TREND_SIGNALS,
 )
@@ -33,6 +45,7 @@ from core.mss import (
 from core.structure import (
     SwingPoint,
     StructureState,
+    build_structure,
 )
 
 
@@ -149,19 +162,19 @@ def check_local_structure(
     mss: MSSSetup,
     structure: List[SwingPoint],
 ) -> tuple[bool, str]:
+    # Market structure shift - это слом структуры, которая вела
+    # цену к свипу: для лонга пробой LH, для шорта пробой HL.
+    # Пробой HH/LL - продолжение уже идущего тренда, а не сдвиг,
+    # такие сетапы статистически слабее и отсекаются.
     if direction == "LONG":
         if mss.structure_label == "LH":
             return True, "Bullish MSS broke LH"
-        if mss.structure_label == "HH":
-            return True, "Bullish MSS broke HH"
-        return False, "Bullish MSS did not break a valid LH/HH structure level"
+        return False, "Bullish MSS did not break an LH structure level"
 
     if direction == "SHORT":
         if mss.structure_label == "HL":
             return True, "Bearish MSS broke HL"
-        if mss.structure_label == "LL":
-            return True, "Bearish MSS broke LL"
-        return False, "Bearish MSS did not break a valid HL/LL structure level"
+        return False, "Bearish MSS did not break an HL structure level"
 
     return False, "Unknown direction"
 
@@ -232,8 +245,13 @@ def find_nearest_liquidity_target(
     # of MIN_RR and TP1_R_MULTIPLE.
     required_rr = max(min_rr, TP1_R_MULTIPLE)
 
-    # Targets are already sorted from nearest to farthest.
-    # Select the nearest liquidity level that supports TP1.
+    # Выбор цели: первый уровень с RR не ниже требуемого.
+    # Функция вызывается по КРУПНЫМ свингам (см. evaluate_setup):
+    # уровни ближе required_rr для геометрии этого сетапа (стоп за
+    # экстремумом свипа, вход по закрытию MSS) целью быть не могут -
+    # до них нет сделки с приемлемым RR. Но и перескакивать через
+    # крупный уровень, который уже даёт нужный RR, нельзя: именно
+    # он является целью, а не следующий за ним.
     for target in targets:
         rr = calculate_rr(
             direction=direction,
@@ -305,7 +323,7 @@ def check_entry_distance_from_mss(
     distance = abs(entry - mss.break_price)
     distance_atr = distance / atr
 
-    if distance_atr <= 1.0:
+    if distance_atr <= MAX_ENTRY_DISTANCE_ATR:
         return True, f"Entry distance {distance_atr:.2f} ATR"
 
     return False, f"Entry too far from MSS: {distance_atr:.2f} ATR"
@@ -436,6 +454,43 @@ def evaluate_setup(
     entry = float(entry_price)
     metrics["entry"] = entry
 
+    # --------------------------------------------------------
+    # FRESHNESS
+    # --------------------------------------------------------
+    # Сетап живёт только сразу после подтверждения MSS. Если с
+    # пробоя прошло больше MAX_SIGNAL_AGE_BARS свечей, цена уже
+    # отыграла движение и "сигнал" превращается в погоню за ценой.
+    last_index = len(df) - 1
+    bars_since_mss = last_index - mss.break_index
+    metrics["bars_since_mss"] = bars_since_mss
+
+    if bars_since_mss < 0:
+        reasons.append("MSS break is in the future relative to data")
+
+    elif bars_since_mss > MAX_SIGNAL_AGE_BARS:
+        reasons.append(
+            f"Stale setup: MSS confirmed {bars_since_mss} bars ago "
+            f"(max {MAX_SIGNAL_AGE_BARS})"
+        )
+
+    # --------------------------------------------------------
+    # PRICE STILL VALID
+    # --------------------------------------------------------
+    # К моменту сигнала цена должна оставаться по нужную сторону
+    # и уровня MSS, и снятого уровня ликвидности. Возврат обратно
+    # означает, что пробой не удержался.
+    if direction == "LONG":
+        if entry <= mss.structure_level:
+            reasons.append("Price fell back below the MSS level")
+        if entry <= sfp.level:
+            reasons.append("Price fell back below the swept level")
+
+    elif direction == "SHORT":
+        if entry >= mss.structure_level:
+            reasons.append("Price rose back above the MSS level")
+        if entry >= sfp.level:
+            reasons.append("Price rose back above the swept level")
+
     htf_aligned, htf_reason, setup_type = check_htf_alignment(
         direction=direction,
         htf_state=htf_state,
@@ -469,8 +524,36 @@ def evaluate_setup(
 
     volume_ratio = calculate_volume_ratio(df=df, index=mss.break_index)
     metrics["volume_ratio"] = volume_ratio
-    if volume_ratio is None or volume_ratio < MIN_VOLUME_RATIO:
+    if REQUIRE_VOLUME_CONFIRMATION:
+        # Объём - обязательное подтверждение пробоя, а не warning.
+        # Пробой на объёме ниже среднего чаще всего фейковый.
+        if volume_ratio is None:
+            reasons.append("Volume confirmation is unavailable")
+        elif volume_ratio < MIN_VOLUME_RATIO:
+            reasons.append(
+                f"Volume confirmation too weak: {volume_ratio:.2f} "
+                f"< {MIN_VOLUME_RATIO:.2f}"
+            )
+    elif volume_ratio is None or volume_ratio < MIN_VOLUME_RATIO:
         warnings.append("Volume confirmation is weak")
+
+    # --------------------------------------------------------
+    # COMPONENT QUALITY GATES
+    # --------------------------------------------------------
+    # Слабый SFP или слабый MSS нельзя компенсировать другими
+    # компонентами итогового score.
+    metrics["sfp_score"] = float(sfp.score)
+    metrics["mss_score"] = float(mss.score)
+
+    if sfp.score < MIN_SFP_SCORE:
+        reasons.append(
+            f"SFP quality too low: {sfp.score:.1f} < {MIN_SFP_SCORE:.1f}"
+        )
+
+    if mss.score < MIN_MSS_SCORE:
+        reasons.append(
+            f"MSS quality too low: {mss.score:.1f} < {MIN_MSS_SCORE:.1f}"
+        )
 
     entry_distance_ok, entry_distance_reason = check_entry_distance_from_mss(
         direction=direction,
@@ -493,11 +576,63 @@ def evaluate_setup(
         elif direction == "SHORT" and stop_loss <= entry:
             reasons.append("SHORT stop loss is not above entry")
 
+        # ----------------------------------------------------
+        # STOP DISTANCE SANITY
+        # ----------------------------------------------------
+        # Слишком широкий стоп означает, что вход уже далеко от
+        # точки инвалидации: сетап растянут, а расчёт позиции и
+        # ликвидации по такому стопу недостоверен.
+        risk_distance = abs(entry - stop_loss)
+        metrics["stop_distance"] = risk_distance
+
+        if atr > 0:
+            stop_distance_atr = risk_distance / atr
+            metrics["stop_distance_atr"] = stop_distance_atr
+            if stop_distance_atr > MAX_STOP_DISTANCE_ATR:
+                reasons.append(
+                    f"Stop distance too wide: {stop_distance_atr:.2f} ATR "
+                    f"> {MAX_STOP_DISTANCE_ATR:.2f} ATR"
+                )
+
+        if entry > 0:
+            stop_distance_percent = risk_distance / entry * 100.0
+            metrics["stop_distance_percent"] = stop_distance_percent
+            if stop_distance_percent > MAX_STOP_DISTANCE_PERCENT:
+                reasons.append(
+                    f"Stop distance too wide: {stop_distance_percent:.2f}% "
+                    f"> {MAX_STOP_DISTANCE_PERCENT:.2f}%"
+                )
+
+        # ----------------------------------------------------
+        # ALREADY STOPPED AFTER MSS
+        # ----------------------------------------------------
+        # Если после пробоя цена уже касалась стопа фитилём,
+        # сделка по этому сетапу уже была бы закрыта в минус.
+        post_mss = df.iloc[mss.break_index + 1:]
+        if not post_mss.empty:
+            if direction == "LONG" and bool(
+                (post_mss["low"] <= stop_loss).any()
+            ):
+                reasons.append("Price already touched stop loss after MSS")
+            elif direction == "SHORT" and bool(
+                (post_mss["high"] >= stop_loss).any()
+            ):
+                reasons.append("Price already touched stop loss after MSS")
+
+    # Цели ищем по крупным свингам (LIQUIDITY_SWING_*), а не по
+    # рабочему фракталу структуры: мелкие свинги 3/3 стоят каждые
+    # несколько свечей, ликвидность скапливается не за ними.
+    liquidity_structure = build_structure(
+        df,
+        left=LIQUIDITY_SWING_LEFT,
+        right=LIQUIDITY_SWING_RIGHT,
+    )
+
     target = find_nearest_liquidity_target(
         direction=direction,
-        current_index=mss.break_index,
+        current_index=last_index,
         current_price=entry,
-        structure=structure,
+        structure=liquidity_structure,
         stop_loss=stop_loss,
         min_rr=MIN_RR,
     )
@@ -524,6 +659,15 @@ def evaluate_setup(
     elif rr < MIN_RR:
         reasons.append(f"RR is below minimum {MIN_RR:.2f}")
 
+    # TP1 ставится на 0.5R перед целью-пулом (фронтраннинг),
+    # TP2 - на сам пул, но не дальше полных TP2_R_MULTIPLE.
+    if rr is not None and rr >= MIN_TP2_R_MULTIPLE:
+        metrics["tp1_r_multiple"] = float(min(TP1_R_MULTIPLE, rr - 0.5))
+        metrics["tp2_r_multiple"] = float(min(TP2_R_MULTIPLE, rr))
+    else:
+        metrics["tp1_r_multiple"] = float(TP1_R_MULTIPLE)
+        metrics["tp2_r_multiple"] = float(TP2_R_MULTIPLE)
+
     htf_component = score_htf(setup_type)
     liquidity_component = score_liquidity(target)
     sfp_component = score_sfp(sfp)
@@ -544,8 +688,17 @@ def evaluate_setup(
 
     metrics["final_score"] = final_score
 
-    if final_score < MIN_SIGNAL_SCORE:
-        reasons.append(f"Signal score {final_score:.1f} is below minimum {MIN_SIGNAL_SCORE:.1f}")
+    # Для контртренда (если включён) порог выше: откат против 4H
+    # тренда должен быть заметно сильнее обычного сетапа.
+    required_score = (
+        COUNTER_TREND_MIN_SIGNAL_SCORE
+        if setup_type == "COUNTER_TREND"
+        else MIN_SIGNAL_SCORE
+    )
+    metrics["required_score"] = required_score
+
+    if final_score < required_score:
+        reasons.append(f"Signal score {final_score:.1f} is below minimum {required_score:.1f}")
 
     passed = len(reasons) == 0
 

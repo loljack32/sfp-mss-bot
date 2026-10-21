@@ -1,0 +1,364 @@
+# ============================================================
+# QUALITY GATE TESTS
+# ============================================================
+# Проверяют, что доработанные фильтры действительно отсекают
+# слабые, устаревшие и нереалистичные сетапы.
+#
+# Запуск из корня репозитория:  python -m unittest discover tests
+# ============================================================
+
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import pandas as pd
+
+from core.sfp import SFPSetup
+from core.mss import MSSSetup, detect_bullish_mss
+from core.structure import SwingPoint, StructureState
+from core.filters import (
+    evaluate_setup,
+    check_local_structure,
+    find_nearest_liquidity_target,
+)
+from core.signals import generate_signal
+from core.okx import normalize_instrument_id
+
+import main as main_module
+
+
+# ============================================================
+# FIXTURES
+# ============================================================
+
+def make_df(
+    n: int = 80,
+    liquidity_price: float = None,
+    liquidity_index: int = 40,
+) -> pd.DataFrame:
+    ts = pd.date_range("2026-01-01", periods=n, freq="15min", tz="UTC")
+    df = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": [100.0] * n,
+            "high": [101.0] * n,
+            "low": [99.0] * n,
+            "close": [100.0] * n,
+            "volume": [1000.0] * n,
+            "confirm": ["1"] * n,
+        }
+    )
+    if liquidity_price is not None and liquidity_index < n:
+        # Крупный свинг (окно 10/10): единственный экстремум выше всех
+        # соседей - уровень ликвидности для evaluate_setup.
+        df.loc[liquidity_index, "high"] = liquidity_price
+    return df
+
+
+def make_sfp(df: pd.DataFrame, sweep_index: int, **overrides) -> SFPSetup:
+    params = dict(
+        direction="LONG",
+        level=99.5,
+        sweep_extreme=99.0,
+        sweep_index=sweep_index,
+        sweep_timestamp=df.iloc[sweep_index]["timestamp"],
+        entry_reference=100.0,
+        atr=1.0,
+        sweep_distance=0.5,
+        sweep_atr_ratio=0.5,
+        reclaim_ratio=0.85,
+        candle_body_ratio=0.7,
+        score=90.0,
+        source_swing_index=10,
+        source_swing_label="LL",
+    )
+    params.update(overrides)
+    return SFPSetup(**params)
+
+
+def make_mss(df: pd.DataFrame, break_index: int, **overrides) -> MSSSetup:
+    params = dict(
+        direction="LONG",
+        structure_level=99.8,
+        structure_label="LH",
+        structure_index=break_index - 8,
+        break_index=break_index,
+        break_timestamp=df.iloc[break_index]["timestamp"],
+        break_price=100.2,
+        displacement=0.8,
+        displacement_atr_ratio=0.8,
+        body_ratio=0.8,
+        candle_range=1.0,
+        score=90.0,
+    )
+    params.update(overrides)
+    return MSSSetup(**params)
+
+
+def make_htf_state() -> StructureState:
+    return StructureState(
+        trend="BULLISH",
+        last_high=None,
+        previous_high=None,
+        last_low=None,
+        previous_low=None,
+        last_swing=None,
+    )
+
+
+def far_liquidity_structure(df: pd.DataFrame, price: float = 130.0):
+    return [
+        SwingPoint(
+            index=10,
+            timestamp=df.iloc[10]["timestamp"],
+            price=price,
+            kind="HIGH",
+            label="HH",
+        )
+    ]
+
+
+# ============================================================
+# TESTS
+# ============================================================
+
+class TestQualityGates(unittest.TestCase):
+    def test_valid_fresh_setup_passes(self):
+        df = make_df(liquidity_price=130.0)
+        break_index = len(df) - 2
+        df.loc[break_index, "volume"] = 2000.0
+
+        result = evaluate_setup(
+            df=df,
+            sfp=make_sfp(df, break_index - 5),
+            mss=make_mss(df, break_index),
+            structure=far_liquidity_structure(df),
+            htf_state=make_htf_state(),
+        )
+
+        self.assertTrue(result.passed, msg=f"reasons: {result.reasons}")
+
+    def test_stale_setup_rejected(self):
+        df = make_df(liquidity_price=130.0)
+        break_index = 60  # 19 баров назад при лимите свежести 2
+
+        result = evaluate_setup(
+            df=df,
+            sfp=make_sfp(df, break_index - 5),
+            mss=make_mss(df, break_index),
+            structure=far_liquidity_structure(df),
+            htf_state=make_htf_state(),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("Stale setup" in r for r in result.reasons),
+            msg=f"reasons: {result.reasons}",
+        )
+
+    def test_weak_volume_is_hard_rejection(self):
+        df = make_df(liquidity_price=130.0)
+        break_index = len(df) - 2
+        df.loc[break_index, "volume"] = 500.0  # 0.5x от среднего
+
+        result = evaluate_setup(
+            df=df,
+            sfp=make_sfp(df, break_index - 5),
+            mss=make_mss(df, break_index),
+            structure=far_liquidity_structure(df),
+            htf_state=make_htf_state(),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("Volume confirmation too weak" in r for r in result.reasons),
+            msg=f"reasons: {result.reasons}",
+        )
+
+    def test_hh_break_is_not_a_bullish_mss(self):
+        df = make_df()
+        ok, _ = check_local_structure(
+            "LONG",
+            make_sfp(df, 70),
+            make_mss(df, 75, structure_label="HH"),
+            [],
+        )
+        self.assertFalse(ok)
+
+        ok, _ = check_local_structure(
+            "LONG",
+            make_sfp(df, 70),
+            make_mss(df, 75, structure_label="LH"),
+            [],
+        )
+        self.assertTrue(ok)
+
+    def test_liquidity_target_selection(self):
+        df = make_df()
+        too_close = SwingPoint(
+            index=10,
+            timestamp=df.iloc[10]["timestamp"],
+            price=101.0,  # RR около 0.95 - целью быть не может
+            kind="HIGH",
+            label="HH",
+        )
+        valid = SwingPoint(
+            index=12,
+            timestamp=df.iloc[12]["timestamp"],
+            price=130.0,
+            kind="HIGH",
+            label="HH",
+        )
+
+        # Слишком близкий уровень пропускается, целью становится
+        # первый уровень с приемлемым RR.
+        target = find_nearest_liquidity_target(
+            direction="LONG",
+            current_index=79,
+            current_price=100.0,
+            structure=[too_close, valid],
+            stop_loss=98.95,
+            min_rr=1.6,
+        )
+        self.assertIsNotNone(target)
+        self.assertEqual(target.price, 130.0)
+
+        # Если приемлемого уровня нет вообще - цели нет.
+        target = find_nearest_liquidity_target(
+            direction="LONG",
+            current_index=79,
+            current_price=100.0,
+            structure=[too_close],
+            stop_loss=98.95,
+            min_rr=1.6,
+        )
+        self.assertIsNone(target)
+
+
+class TestMSSLevelSelection(unittest.TestCase):
+    def test_mss_uses_lh_after_swept_low_not_any_high(self):
+        df = make_df(40)
+        # Сильная бычья свеча пробоя на индексе 25.
+        df.loc[25, ["open", "high", "low", "close"]] = [100.0, 106.5, 99.5, 106.0]
+
+        structure = [
+            SwingPoint(
+                index=5,
+                timestamp=df.iloc[5]["timestamp"],
+                price=90.0,
+                kind="LOW",
+                label="LL",
+            ),
+            SwingPoint(
+                index=8,
+                timestamp=df.iloc[8]["timestamp"],
+                price=110.0,
+                kind="HIGH",
+                label="HH",
+            ),
+            SwingPoint(
+                index=12,
+                timestamp=df.iloc[12]["timestamp"],
+                price=105.0,
+                kind="HIGH",
+                label="LH",
+            ),
+        ]
+
+        sfp = make_sfp(
+            df,
+            sweep_index=20,
+            level=90.0,
+            sweep_extreme=89.5,
+            source_swing_index=5,
+        )
+
+        mss = detect_bullish_mss(df, sfp, structure)
+
+        self.assertIsNotNone(mss)
+        self.assertEqual(mss.structure_label, "LH")
+        self.assertEqual(mss.structure_level, 105.0)
+
+
+class TestRiskGuards(unittest.TestCase):
+    def _kwargs(self, df):
+        break_index = len(df) - 2
+        df.loc[break_index, "volume"] = 2000.0
+        return dict(
+            symbol="BTC-USDT-SWAP",
+            timeframe="15m",
+            df=df,
+            sfp=make_sfp(df, break_index - 5),
+            mss=make_mss(df, break_index),
+            structure=far_liquidity_structure(df),
+            htf_state=make_htf_state(),
+            balance=10000.0,
+        )
+
+    def test_margin_above_balance_rejected(self):
+        df = make_df(liquidity_price=130.0)
+        # Риск 5% при плече 1x: маржа = весь номинал >> баланса.
+        signal = generate_signal(
+            risk_percent=5.0, leverage=1, **self._kwargs(df)
+        )
+        self.assertIsNone(signal)
+
+        df = make_df(liquidity_price=130.0)
+        signal = generate_signal(
+            risk_percent=5.0, leverage=10, **self._kwargs(df)
+        )
+        self.assertIsNotNone(signal)
+
+    def test_tp2_capped_at_nearest_liquidity(self):
+        # Ликвидность на 2.5R: TP2 должен встать на неё, а не на 3R.
+        df = make_df(liquidity_price=102.625)
+        kwargs = self._kwargs(df)
+
+        signal = generate_signal(risk_percent=1.0, leverage=10, **kwargs)
+
+        self.assertIsNotNone(signal)
+        self.assertAlmostEqual(signal.tp2, 102.625, places=6)
+        self.assertAlmostEqual(signal.rr_tp2, 2.5, places=2)
+
+
+class TestDedupeAndInstruments(unittest.TestCase):
+    def test_setup_never_resent_but_new_setup_allowed(self):
+        df = make_df()
+        sfp = make_sfp(df, 70)
+        mss = make_mss(df, 75)
+
+        state = {}
+        main_module.record_signal_sent(
+            "BTC-USDT-SWAP", "LONG", state, sfp=sfp, mss=mss
+        )
+
+        # Тот же сетап блокируется даже при нулевом кулдауне по символу.
+        self.assertTrue(
+            main_module.is_on_cooldown(
+                "BTC-USDT-SWAP", "LONG", state,
+                cooldown_minutes=0, sfp=sfp, mss=mss,
+            )
+        )
+
+        # Другой сетап при нулевом кулдауне не блокируется.
+        other_mss = make_mss(df, 76)
+        self.assertFalse(
+            main_module.is_on_cooldown(
+                "BTC-USDT-SWAP", "LONG", state,
+                cooldown_minutes=0, sfp=sfp, mss=other_mss,
+            )
+        )
+
+    def test_normalize_instrument_id(self):
+        self.assertEqual(
+            normalize_instrument_id("BTC-USDT"), "BTC-USDT-SWAP"
+        )
+        self.assertEqual(
+            normalize_instrument_id("BTC-USDT-SWAP"), "BTC-USDT-SWAP"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

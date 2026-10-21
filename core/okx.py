@@ -13,6 +13,7 @@ import requests
 
 from config import (
     OKX_BASE_URL,
+    MARKET_TYPE,
     CANDLE_LIMIT,
     REQUEST_TIMEOUT,
     MAX_RETRIES,
@@ -26,6 +27,7 @@ from config import (
 # ============================================================
 
 CANDLES_ENDPOINT = "/api/v5/market/candles"
+HISTORY_CANDLES_ENDPOINT = "/api/v5/market/history-candles"
 TICKERS_ENDPOINT = "/api/v5/market/tickers"
 
 SUPPORTED_TIMEFRAMES = {
@@ -66,6 +68,25 @@ class OKXResponseError(OKXError):
 
 class OKXDataError(OKXError):
     """Некорректные или пустые данные от OKX."""
+
+
+# ============================================================
+# INSTRUMENT IDS
+# ============================================================
+
+def normalize_instrument_id(symbol: str) -> str:
+    """
+    Приводит тикер к ID инструмента выбранного рынка.
+
+    Для SWAP: "BTC-USDT" -> "BTC-USDT-SWAP".
+    Уже полные ID не трогает.
+    """
+    symbol = symbol.strip().upper()
+
+    if MARKET_TYPE == "SWAP" and not symbol.endswith("-SWAP"):
+        return f"{symbol}-SWAP"
+
+    return symbol
 
 
 # ============================================================
@@ -185,13 +206,21 @@ class OKXClient:
         """
         Получает топ N инструментов по объёму торгов за 24 часа.
         Фильтрует стейблкоины и неликвидные пары.
+
+        Рынок берётся из config.MARKET_TYPE. Для SWAP поле
+        volCcy24h - это объём в базовой валюте, поэтому оборот
+        в USDT считается как volCcy24h * last price.
         """
-        params = {"instType": "SPOT"}
+        params = {"instType": MARKET_TYPE}
         payload = self._request(TICKERS_ENDPOINT, params=params)
         data = payload.get("data", [])
 
         valid_tickers = []
-        suffix = f"-{quote_currency}"
+
+        if MARKET_TYPE == "SWAP":
+            suffix = f"-{quote_currency}-SWAP"
+        else:
+            suffix = f"-{quote_currency}"
 
         for item in data:
             inst_id = item.get("instId", "")
@@ -203,14 +232,23 @@ class OKXClient:
                 continue
 
             try:
-                vol_usdt = float(item.get("volCcy24h", 0.0))
+                vol_ccy = float(item.get("volCcy24h", 0.0))
             except (ValueError, TypeError):
-                vol_usdt = 0.0
+                vol_ccy = 0.0
 
-            if vol_usdt >= min_volume_usdt:
-                valid_tickers.append((inst_id, vol_usdt))
+            if MARKET_TYPE == "SWAP":
+                try:
+                    last_price = float(item.get("last", 0.0))
+                except (ValueError, TypeError):
+                    last_price = 0.0
+                turnover_usdt = vol_ccy * last_price
+            else:
+                turnover_usdt = vol_ccy
 
-        # Сортируем по убыванию суточного объёма в USDT
+            if turnover_usdt >= min_volume_usdt:
+                valid_tickers.append((inst_id, turnover_usdt))
+
+        # Сортируем по убыванию суточного оборота в USDT
         valid_tickers.sort(key=lambda x: x[1], reverse=True)
 
         return [t[0] for t in valid_tickers[:top_n]]
@@ -225,6 +263,7 @@ class OKXClient:
         timeframe: str,
         limit: int = CANDLE_LIMIT,
     ) -> list[list[str]]:
+        symbol = normalize_instrument_id(symbol)
         self.validate_symbol(symbol)
         self.validate_timeframe(timeframe)
 
@@ -243,19 +282,11 @@ class OKXClient:
 
         return data
 
-    def get_candles(
-        self,
-        symbol: str,
-        timeframe: str,
-        limit: int = CANDLE_LIMIT,
+    @staticmethod
+    def _parse_candles(
+        raw: list[list[str]],
         closed_only: bool = True,
     ) -> pd.DataFrame:
-        raw = self.get_raw_candles(
-            symbol=symbol,
-            timeframe=timeframe,
-            limit=limit,
-        )
-
         rows = []
         for candle in raw:
             if len(candle) < 9:
@@ -280,7 +311,7 @@ class OKXClient:
                 continue
 
         if not rows:
-            raise OKXDataError(f"No valid candles for {symbol} {timeframe}.")
+            raise OKXDataError("No valid candles in response.")
 
         df = pd.DataFrame(rows)
         if closed_only:
@@ -293,7 +324,75 @@ class OKXClient:
         )
 
         if df.empty:
-            raise OKXDataError(f"No closed candles for {symbol} {timeframe}.")
+            raise OKXDataError("No closed candles in response.")
+
+        return df
+
+    def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int = CANDLE_LIMIT,
+        closed_only: bool = True,
+    ) -> pd.DataFrame:
+        raw = self.get_raw_candles(
+            symbol=symbol,
+            timeframe=timeframe,
+            limit=limit,
+        )
+
+        return self._parse_candles(raw, closed_only=closed_only)
+
+    def get_candles_history(
+        self,
+        symbol: str,
+        timeframe: str,
+        total_bars: int,
+    ) -> pd.DataFrame:
+        """
+        Скачивает длинную историю свечей через history-candles
+        с пагинацией (по 100 свечей за запрос, курсор `after`).
+
+        Используется бэктестером.
+        """
+        symbol = normalize_instrument_id(symbol)
+        self.validate_symbol(symbol)
+        self.validate_timeframe(timeframe)
+
+        total_bars = max(1, int(total_bars))
+        collected: list[list[str]] = []
+        after: Optional[str] = None
+
+        while len(collected) < total_bars:
+            params = {
+                "instId": symbol,
+                "bar": timeframe,
+                "limit": "100",
+            }
+            if after is not None:
+                params["after"] = after
+
+            payload = self._request(HISTORY_CANDLES_ENDPOINT, params=params)
+            data = payload.get("data")
+
+            if not isinstance(data, list) or not data:
+                break
+
+            collected.extend(data)
+            after = data[-1][0]
+
+            if len(data) < 100:
+                break
+
+        if not collected:
+            raise OKXDataError(
+                f"No history candles returned for {symbol} {timeframe}."
+            )
+
+        df = self._parse_candles(collected, closed_only=True)
+
+        if len(df) > total_bars:
+            df = df.iloc[-total_bars:].reset_index(drop=True)
 
         return df
 

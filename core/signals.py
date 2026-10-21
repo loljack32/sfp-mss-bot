@@ -182,6 +182,20 @@ def build_signal(
         raise ValueError("Filter result does not contain a valid stop loss.")
     stop_loss = float(stop_loss)
 
+    # TP1 может быть ближе полных TP1_R_MULTIPLE, если пул
+    # ликвидности находится раньше: тейк ставится на 0.5R перед ним.
+    tp1_multiple = filter_result.metrics.get("tp1_r_multiple")
+    tp1_multiple = (
+        float(tp1_multiple) if tp1_multiple is not None else TP1_R_MULTIPLE
+    )
+
+    # TP2 может быть ближе полных TP2_R_MULTIPLE, если ближайшая
+    # ликвидность находится раньше: тейк ставится на неё, а не за неё.
+    tp2_multiple = filter_result.metrics.get("tp2_r_multiple")
+    tp2_multiple = (
+        float(tp2_multiple) if tp2_multiple is not None else TP2_R_MULTIPLE
+    )
+
     # Расчёт риска и маржи с учётом плеча
     risk = calculate_risk(
         direction=sfp.direction,
@@ -190,8 +204,8 @@ def build_signal(
         entry=entry,
         stop_loss=stop_loss,
         leverage=leverage,
-        tp1_rr=TP1_R_MULTIPLE,
-        tp2_rr=TP2_R_MULTIPLE,
+        tp1_rr=tp1_multiple,
+        tp2_rr=tp2_multiple,
     )
 
     # Жёсткие минимальные требования к RR.
@@ -210,6 +224,38 @@ def build_signal(
         balance=balance,
         position_notional=risk.position_notional,
     )
+
+    # Маржа под позицию не может превышать баланс: такой сигнал
+    # физически невозможно открыть при заданном плече.
+    if risk.margin_required > balance:
+        raise ValueError(
+            f"Required margin ${risk.margin_required:,.2f} exceeds "
+            f"balance ${balance:,.2f} at {risk.leverage}x leverage."
+        )
+
+    # Стоп должен срабатывать заметно раньше ликвидации, иначе
+    # позиция закроется ликвидацией, а не стопом. Требуем, чтобы
+    # дистанция до стопа была не больше 80% дистанции до ликвидации.
+    if risk.estimated_liquidation > 0:
+        if sfp.direction == "LONG":
+            liquidation_distance = entry - risk.estimated_liquidation
+            if stop_loss <= risk.estimated_liquidation:
+                raise ValueError(
+                    "LONG stop loss is beyond the estimated liquidation price."
+                )
+        else:
+            liquidation_distance = risk.estimated_liquidation - entry
+            if stop_loss >= risk.estimated_liquidation:
+                raise ValueError(
+                    "SHORT stop loss is beyond the estimated liquidation price."
+                )
+
+        if liquidation_distance > 0 and (
+            risk.stop_distance > 0.8 * liquidation_distance
+        ):
+            raise ValueError(
+                "Stop distance is too close to the liquidation distance."
+            )
 
     liquidity_target = filter_result.metrics.get("liquidity_target")
     if liquidity_target is not None:

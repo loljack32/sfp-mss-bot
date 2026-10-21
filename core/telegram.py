@@ -64,8 +64,8 @@ def format_signal_message(signal: TradingSignal) -> str:
         "🎯 <b>Trade Parameters:</b>",
         f"• <b>Entry:</b> <code>{fmt_price(signal.entry)}</code>",
         f"• <b>Stop Loss:</b> <code>{fmt_price(signal.stop_loss)}</code> (<code>{signal.stop_distance_percent:.2f}%</code>)",
-        f"• <b>TP1 (1R):</b> <code>{fmt_price(signal.tp1)}</code> [RR {signal.rr_tp1:.2f}]",
-        f"• <b>TP2 (2R):</b> <code>{fmt_price(signal.tp2)}</code> [RR {signal.rr_tp2:.2f}]",
+        f"• <b>TP1 ({signal.rr_tp1:.2f}R):</b> <code>{fmt_price(signal.tp1)}</code> [RR {signal.rr_tp1:.2f}]",
+        f"• <b>TP2 ({signal.rr_tp2:.2f}R):</b> <code>{fmt_price(signal.tp2)}</code> [RR {signal.rr_tp2:.2f}]",
     ]
 
     if signal.liquidity_target is not None:

@@ -86,6 +86,12 @@ class SFPSetup:
 
     score: float
 
+    # Свинг, чью ликвидность снял свип. Нужен MSS, чтобы искать
+    # структурный уровень на отрезке после этого свинга, а не любой
+    # старый уровень из истории.
+    source_swing_index: int = -1
+    source_swing_label: str = ""
+
 
 # ============================================================
 # ATR
@@ -317,6 +323,8 @@ def detect_bullish_sfp(
         reclaim_ratio=reclaim_ratio,
         candle_body_ratio=body_ratio,
         score=score,
+        source_swing_index=swing.index,
+        source_swing_label=swing.label,
     )
 
 
@@ -448,6 +456,8 @@ def detect_bearish_sfp(
         reclaim_ratio=reclaim_ratio,
         candle_body_ratio=body_ratio,
         score=score,
+        source_swing_index=swing.index,
+        source_swing_label=swing.label,
     )
 
 
@@ -731,4 +741,6 @@ def sfp_to_dict(
         "reclaim_ratio": sfp.reclaim_ratio,
         "candle_body_ratio": sfp.candle_body_ratio,
         "score": sfp.score,
+        "source_swing_index": sfp.source_swing_index,
+        "source_swing_label": sfp.source_swing_label,
     }

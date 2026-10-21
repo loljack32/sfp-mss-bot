@@ -159,8 +159,14 @@ def detect_bullish_mss(
              ↓
         MSS confirmed
 
-    Для bullish MSS нас интересует HIGH, который находится
-    перед SFP и представляет собой локальную bearish structure.
+    Для bullish MSS нужен пробой последнего LH (lower high),
+    который сформировал нисходящую структуру перед свипом.
+    Пробой HH - это продолжение аптренда, а не market structure
+    shift, поэтому он не засчитывается.
+
+    Кандидатный LH должен находиться ПОСЛЕ свипнутого swing low
+    и ДО свечи свипа: это уровень той самой локальной структуры,
+    которая привела цену к снятию ликвидности.
     """
 
     if sfp.direction != "LONG":
@@ -170,7 +176,7 @@ def detect_bullish_mss(
         return None
 
     # --------------------------------------------------------
-    # Ищем структурный HIGH перед SFP.
+    # Ищем структурный LH после свипнутого low и перед SFP.
     # --------------------------------------------------------
 
     candidate_highs = [
@@ -178,14 +184,16 @@ def detect_bullish_mss(
         for swing in structure
         if (
             swing.kind == "HIGH"
+            and swing.label == "LH"
             and swing.index < sfp.sweep_index
+            and swing.index > sfp.source_swing_index
         )
     ]
 
     if not candidate_highs:
         return None
 
-    # Последний подтверждённый high перед SFP.
+    # Последний LH перед SFP - уровень локальной bearish structure.
     structure_high = candidate_highs[-1]
 
     start_index = (
@@ -335,13 +343,16 @@ def detect_bearish_mss(
 
         Bearish SFP
              ↓
-        найти последний значимый LOW
+        найти последний HL после свипнутого high
              ↓
-        цена закрывается ниже LOW
+        цена закрывается ниже HL
              ↓
         displacement
              ↓
         MSS confirmed
+
+    Пробой LL - продолжение даунтренда, а не сдвиг структуры,
+    поэтому засчитывается только пробой HL (higher low).
     """
 
     if sfp.direction != "SHORT":
@@ -351,7 +362,7 @@ def detect_bearish_mss(
         return None
 
     # --------------------------------------------------------
-    # Ищем LOW перед SFP.
+    # Ищем HL после свипнутого high и перед SFP.
     # --------------------------------------------------------
 
     candidate_lows = [
@@ -359,7 +370,9 @@ def detect_bearish_mss(
         for swing in structure
         if (
             swing.kind == "LOW"
+            and swing.label == "HL"
             and swing.index < sfp.sweep_index
+            and swing.index > sfp.source_swing_index
         )
     ]
 

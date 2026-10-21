@@ -31,6 +31,9 @@ from config import (
     MIN_TP2_R_MULTIPLE,
     SIGNAL_SCORE_WEIGHTS,
     ENABLE_COUNTER_TREND_SIGNALS,
+    ENABLE_SHORT_SIGNALS,
+    EXTENSION_LOOKBACK_BARS,
+    MAX_ENTRY_EXTENSION_ATR,
 )
 
 from core.sfp import (
@@ -448,6 +451,31 @@ def evaluate_setup(
     metrics = {}
 
     direction = sfp.direction
+
+    if direction == "SHORT" and not ENABLE_SHORT_SIGNALS:
+        reasons.append("Short signals disabled by config")
+
+    # --------------------------------------------------------
+    # ANTI-CHASE
+    # --------------------------------------------------------
+    # Если цена уже прошла далеко в сторону сделки за последние
+    # EXTENSION_LOOKBACK_BARS баров, свип + MSS происходят на
+    # истощении движения, а не в его начале.
+    if len(df) > EXTENSION_LOOKBACK_BARS and sfp.atr and float(sfp.atr) > 0:
+        closes = df["close"]
+        extension = (
+            float(closes.iloc[-1])
+            - float(closes.iloc[-1 - EXTENSION_LOOKBACK_BARS])
+        ) / float(sfp.atr)
+        if direction == "SHORT":
+            extension = -extension
+        metrics["entry_extension_atr"] = round(extension, 3)
+        if extension > MAX_ENTRY_EXTENSION_ATR:
+            reasons.append(
+                f"Entry chase: price already moved {extension:.2f} ATR "
+                f"in signal direction over {EXTENSION_LOOKBACK_BARS} bars "
+                f"(max {MAX_ENTRY_EXTENSION_ATR})"
+            )
 
     if entry_price is None:
         entry_price = float(df.iloc[-1]["close"])

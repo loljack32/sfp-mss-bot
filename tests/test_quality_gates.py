@@ -360,5 +360,109 @@ class TestDedupeAndInstruments(unittest.TestCase):
         )
 
 
+class TestSituationalFilters(unittest.TestCase):
+    """Фильтры по итогам разбора убыточных сделок (бэктест 6 мес.)."""
+
+    def test_chase_entry_rejected(self):
+        df = make_df(liquidity_price=160.0)
+        n = len(df)
+        # Цена уже прошла +30 при ATR=1 за последние 21 бар - погоня.
+        for i in range(n - 21, n):
+            c = 100.0 + (i - (n - 21)) * 1.5
+            df.loc[i, "close"] = c
+            df.loc[i, "open"] = c
+            df.loc[i, "high"] = c + 0.5
+            df.loc[i, "low"] = c - 0.5
+        break_index = n - 2
+        df.loc[break_index, "volume"] = 2000.0
+
+        result = evaluate_setup(
+            df=df,
+            sfp=make_sfp(df, break_index - 5),
+            mss=make_mss(df, break_index),
+            structure=far_liquidity_structure(df, price=160.0),
+            htf_state=make_htf_state(),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("Entry chase" in r for r in result.reasons),
+            msg=f"reasons: {result.reasons}",
+        )
+
+    def test_short_rejected_when_disabled(self):
+        df = make_df()
+        break_index = len(df) - 2
+        df.loc[break_index, "volume"] = 2000.0
+        structure = [
+            SwingPoint(
+                index=10,
+                timestamp=df.iloc[10]["timestamp"],
+                price=70.0,
+                kind="LOW",
+                label="LL",
+            )
+        ]
+
+        result = evaluate_setup(
+            df=df,
+            sfp=make_sfp(
+                df,
+                break_index - 5,
+                direction="SHORT",
+                level=100.5,
+                sweep_extreme=101.0,
+                source_swing_label="HH",
+            ),
+            mss=make_mss(
+                df,
+                break_index,
+                direction="SHORT",
+                structure_level=100.2,
+                structure_label="HL",
+                break_price=99.8,
+            ),
+            structure=structure,
+            htf_state=make_htf_state(),
+        )
+
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("Short signals disabled" in r for r in result.reasons),
+            msg=f"reasons: {result.reasons}",
+        )
+
+
+class TestBreakevenOutcome(unittest.TestCase):
+    def test_breakeven_exit_after_plus_1r(self):
+        from types import SimpleNamespace
+
+        from backtest import _simulate_outcome
+
+        signal = SimpleNamespace(
+            entry=100.0,
+            stop_loss=95.0,
+            tp1=110.0,
+            tp2=115.0,
+            rr_tp1=2.0,
+            rr_tp2=3.0,
+            direction="LONG",
+        )
+        df = pd.DataFrame(
+            [
+                (101.0, 99.0, 100.0),   # сигнальный бар
+                (106.0, 99.0, 105.0),   # +1.2R: безубыток взводится
+                (103.0, 99.5, 102.0),   # откат в точку входа: выход BE
+                (112.0, 101.0, 111.0),  # недостижим
+            ],
+            columns=["high", "low", "close"],
+        )
+
+        out = _simulate_outcome(df, signal, 0, 10)
+
+        self.assertEqual(out["exit"], "BE")
+        self.assertAlmostEqual(out["result_r"], -0.05, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

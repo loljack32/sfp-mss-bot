@@ -45,6 +45,8 @@ from config import (
     HTF_SWING_LEFT,
     HTF_SWING_RIGHT,
     MAX_SIGNAL_AGE_BARS,
+    ENABLE_BREAKEVEN,
+    BREAKEVEN_TRIGGER_R,
 )
 
 from core.okx import OKXClient, normalize_instrument_id
@@ -76,21 +78,36 @@ def _htf_state_asof(
     htf_structure,
     ltf_close_time: pd.Timestamp,
     htf_duration: pd.Timedelta,
+    close_times_ns: Optional[np.ndarray] = None,
+    cache: Optional[dict] = None,
 ):
     """Состояние HTF-структуры только по закрытым HTF-свечам."""
-    closed = int(((htf_df["timestamp"] + htf_duration) <= ltf_close_time).sum())
+    if close_times_ns is None:
+        close_times_ns = (
+            (htf_df["timestamp"] + htf_duration).astype("int64").to_numpy()
+        )
+
+    # Сравнение в int64 наносекундах: без проблем с tz-aware/naive.
+    closed = int(
+        np.searchsorted(close_times_ns, int(ltf_close_time.value), side="right")
+    )
     last_closed_index = closed - 1
 
     if last_closed_index < 0:
         return None
 
+    if cache is not None and last_closed_index in cache:
+        return cache[last_closed_index]
+
     confirmed = _confirmed_swings(
         htf_structure, last_closed_index, HTF_SWING_RIGHT
     )
-    if not confirmed:
-        return None
+    state = get_structure_state(confirmed) if confirmed else None
 
-    return get_structure_state(confirmed)
+    if cache is not None:
+        cache[last_closed_index] = state
+
+    return state
 
 
 def _invalidated_asof(
@@ -125,6 +142,8 @@ def _simulate_outcome(
     Половина объёма закрывается на TP1, половина - на TP2.
     Если вторая половина доходит до исходного стопа, она в -1R.
     При одновременном касании SL и TP в одной свече - SL первым.
+    Безубыток: после хода в плюс на BREAKEVEN_TRIGGER_R стоп
+    переносится в точку входа (действует со следующего бара).
     """
     entry = signal.entry
     stop = signal.stop_loss
@@ -135,6 +154,8 @@ def _simulate_outcome(
 
     end = min(len(df) - 1, start_index + horizon)
     tp1_done = False
+    be_armed = False
+    active_stop = stop
 
     def mtm_r(price: float) -> float:
         if is_long:
@@ -146,16 +167,20 @@ def _simulate_outcome(
         low = float(df.iloc[j]["low"])
 
         if is_long:
-            hit_stop = low <= stop
+            hit_stop = low <= active_stop
             hit_tp1 = high >= tp1
             hit_tp2 = high >= tp2
+            fav_r = (high - entry) / risk_distance
         else:
-            hit_stop = high >= stop
+            hit_stop = high >= active_stop
             hit_tp1 = low <= tp1
             hit_tp2 = low <= tp2
+            fav_r = (entry - low) / risk_distance
 
         if not tp1_done:
             if hit_stop:
+                if be_armed:
+                    return {"result_r": 0.0 - COST_R, "exit": "BE", "bars": j - start_index}
                 return {"result_r": -1.0 - COST_R, "exit": "SL", "bars": j - start_index}
             if hit_tp1:
                 tp1_done = True
@@ -164,11 +189,18 @@ def _simulate_outcome(
                     return {"result_r": blended - COST_R, "exit": "TP2", "bars": j - start_index}
         else:
             if hit_stop:
+                if be_armed:
+                    blended = 0.5 * signal.rr_tp1 + 0.0
+                    return {"result_r": blended - COST_R, "exit": "TP1+BE", "bars": j - start_index}
                 blended = 0.5 * signal.rr_tp1 - 0.5
                 return {"result_r": blended - COST_R, "exit": "TP1+SL", "bars": j - start_index}
             if hit_tp2:
                 blended = 0.5 * signal.rr_tp1 + 0.5 * signal.rr_tp2
                 return {"result_r": blended - COST_R, "exit": "TP2", "bars": j - start_index}
+
+        if ENABLE_BREAKEVEN and not be_armed and fav_r >= BREAKEVEN_TRIGGER_R:
+            be_armed = True
+            active_stop = entry
 
     last_close = float(df.iloc[end]["close"])
     if tp1_done:
@@ -218,6 +250,17 @@ def backtest_symbol(
         if mss is not None:
             pairs.append((sfp, mss))
 
+    # Индекс пар по бару пробоя: на баре i свежи только пары с
+    # break_index в окне [i - MAX_SIGNAL_AGE_BARS, i].
+    pairs_by_break: Dict[int, list] = {}
+    for pair in pairs:
+        pairs_by_break.setdefault(pair[1].break_index, []).append(pair)
+
+    htf_close_times_ns = (
+        (df_htf["timestamp"] + htf_duration).astype("int64").to_numpy()
+    )
+    htf_state_cache: dict = {}
+
     closes = df["close"].to_numpy(dtype=float)
 
     trades: List[dict] = []
@@ -230,26 +273,23 @@ def backtest_symbol(
 
         # Кандидаты: MSS уже случился и ещё свеж к бару i.
         candidates = []
-        for sfp, mss in pairs:
-            if mss.break_index > i:
-                continue
-            if i - mss.break_index > MAX_SIGNAL_AGE_BARS:
-                continue
-            # Все свинги сетапа должны быть подтверждены к бару i,
-            # иначе в live-сканере их бы ещё не существовало.
-            if sfp.source_swing_index + SWING_RIGHT > i:
-                continue
-            if mss.structure_index + SWING_RIGHT > i:
-                continue
-            if _invalidated_asof(
-                closes, sfp.direction, sfp.sweep_extreme, sfp.sweep_index, i
-            ):
-                continue
-            if _invalidated_asof(
-                closes, sfp.direction, sfp.sweep_extreme, mss.break_index, i
-            ):
-                continue
-            candidates.append((sfp, mss))
+        for b in range(max(0, i - MAX_SIGNAL_AGE_BARS), i + 1):
+            for sfp, mss in pairs_by_break.get(b, []):
+                # Все свинги сетапа должны быть подтверждены к бару i,
+                # иначе в live-сканере их бы ещё не существовало.
+                if sfp.source_swing_index + SWING_RIGHT > i:
+                    continue
+                if mss.structure_index + SWING_RIGHT > i:
+                    continue
+                if _invalidated_asof(
+                    closes, sfp.direction, sfp.sweep_extreme, sfp.sweep_index, i
+                ):
+                    continue
+                if _invalidated_asof(
+                    closes, sfp.direction, sfp.sweep_extreme, mss.break_index, i
+                ):
+                    continue
+                candidates.append((sfp, mss))
 
         if not candidates:
             continue
@@ -267,7 +307,12 @@ def backtest_symbol(
 
         ltf_close_time = df.iloc[i]["timestamp"] + ltf_duration
         htf_state = _htf_state_asof(
-            df_htf, htf_structure_full, ltf_close_time, htf_duration
+            df_htf,
+            htf_structure_full,
+            ltf_close_time,
+            htf_duration,
+            close_times_ns=htf_close_times_ns,
+            cache=htf_state_cache,
         )
         if htf_state is None or htf_state.trend not in {"BULLISH", "BEARISH"}:
             continue
@@ -346,6 +391,21 @@ def summarize(trades: List[dict], title: str) -> None:
     print(f"Итого:         {total_r:+.2f}R")
     print(f"Profit factor: {profit_factor:.2f}")
     print(f"Макс. просадка: {max_dd:.2f}R")
+
+    # Разбивка по направлениям и типам выхода - для настройки.
+    from collections import Counter
+
+    for direction in ("LONG", "SHORT"):
+        subset = [t for t in trades if t["direction"] == direction]
+        if subset:
+            r = np.array([t["result_r"] for t in subset], dtype=float)
+            print(
+                f"  {direction}: {len(subset)} сделок, "
+                f"winrate {100.0 * (r > 0).mean():.0f}%, итого {r.sum():+.2f}R"
+            )
+
+    exits = Counter(t["exit"] for t in trades)
+    print("  Выходы: " + ", ".join(f"{k}={v}" for k, v in exits.most_common()))
 
 
 def main() -> int:

@@ -18,6 +18,8 @@ from config import (
     TP1_R_MULTIPLE,
     TP2_R_MULTIPLE,
     ENABLE_COUNTER_TREND_SIGNALS,
+    ENABLE_BREAKEVEN,
+    BREAKEVEN_TRIGGER_R,
 )
 
 from core.structure import (
@@ -428,8 +430,7 @@ def signal_to_text(signal: TradingSignal) -> str:
         f"TF: {signal.timeframe}",
         f"Score: {signal.signal_score:.1f}",
         f"Entry: {signal.entry:.8f}",
-        f"SL: {signal.stop_loss:.8f}",
-        f"TP1: {signal.tp1:.8f} ({signal.rr_tp1:.2f}R / RR {signal.rr_tp1:.2f})",
+        f"SL: {signal.stop_loss:.8f}",        f"TP1: {signal.tp1:.8f} ({signal.rr_tp1:.2f}R / RR {signal.rr_tp1:.2f})",
         f"TP2: {signal.tp2:.8f} ({signal.rr_tp2:.2f}R / RR {signal.rr_tp2:.2f})",
         f"Плечо: {signal.leverage}x | Маржа: ${signal.margin_required:.2f}",
         f"Номинал: ${signal.position_notional:.2f} ({signal.position_size:.6f})",
@@ -438,6 +439,11 @@ def signal_to_text(signal: TradingSignal) -> str:
         f"SFP score: {signal.sfp_score:.1f} | MSS score: {signal.mss_score:.1f}",
         f"HTF: {signal.htf_trend}",
     ]
+
+    if ENABLE_BREAKEVEN:
+        lines.append(
+            f"BE: после +{BREAKEVEN_TRIGGER_R:.1f}R перенос стопа в точку входа"
+        )
 
     if signal.liquidity_target is not None:
         lines.append(f"Liquidity: {signal.liquidity_target:.8f}")

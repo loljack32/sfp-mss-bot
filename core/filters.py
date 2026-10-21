@@ -34,6 +34,12 @@ from config import (
     ENABLE_SHORT_SIGNALS,
     EXTENSION_LOOKBACK_BARS,
     MAX_ENTRY_EXTENSION_ATR,
+    ENABLE_HTF_DIST_FILTER,
+    ENABLE_REGIME_FILTER,
+    REGIME_EMA_PERIOD,
+    HTF_EMA_PERIOD,
+    HTF_DIST_MIN_ATR,
+    HTF_DIST_MAX_ATR,
 )
 
 from core.sfp import (
@@ -118,6 +124,45 @@ def calculate_atr_percent(
         return None
 
     return float(atr_value) / close
+
+
+def compute_htf_ema_dist_atr(htf_df: pd.DataFrame) -> Optional[float]:
+    """
+    Дистанция цены старшего ТФ от её EMA: (close - EMA) / ATR.
+
+    htf_df должен содержать только закрытые свечи; берётся
+    последняя. None, если данных не хватает или ATR невалиден.
+    """
+    if htf_df is None or len(htf_df) < HTF_EMA_PERIOD + ATR_PERIOD:
+        return None
+
+    closes = htf_df["close"]
+    ema_value = closes.ewm(span=HTF_EMA_PERIOD, adjust=False).mean().iloc[-1]
+    atr_value = calculate_atr(htf_df, period=ATR_PERIOD).iloc[-1]
+
+    if pd.isna(ema_value) or pd.isna(atr_value) or float(atr_value) <= 0:
+        return None
+
+    return float((float(closes.iloc[-1]) - float(ema_value)) / float(atr_value))
+
+
+def compute_regime_uptrend(
+    regime_df: pd.DataFrame, period: int = REGIME_EMA_PERIOD
+) -> Optional[bool]:
+    """
+    Режим широкого рынка по бенчмарку: True, если последняя
+    закрытая свеча бенчмарка выше своей EMA(period). None, если
+    данных не хватает.
+    """
+    if regime_df is None or len(regime_df) < period:
+        return None
+
+    closes = regime_df["close"]
+    ema_value = closes.ewm(span=period, adjust=False).mean().iloc[-1]
+    if pd.isna(ema_value):
+        return None
+
+    return bool(float(closes.iloc[-1]) > float(ema_value))
 
 
 # ============================================================
@@ -443,6 +488,8 @@ def evaluate_setup(
     htf_state: StructureState,
     entry_price: Optional[float] = None,
     allow_counter_trend: bool = ENABLE_COUNTER_TREND_SIGNALS,
+    htf_dist_atr: Optional[float] = None,
+    regime_uptrend: Optional[bool] = None,
     *args,
     **kwargs,
 ) -> FilterResult:
@@ -475,6 +522,42 @@ def evaluate_setup(
                 f"Entry chase: price already moved {extension:.2f} ATR "
                 f"in signal direction over {EXTENSION_LOOKBACK_BARS} bars "
                 f"(max {MAX_ENTRY_EXTENSION_ATR})"
+            )
+
+    # --------------------------------------------------------
+    # HTF DISTANCE WINDOW
+    # --------------------------------------------------------
+    # Вход только когда цена старшего ТФ рядом со своей EMA:
+    # движение началось, но не выдохлось. htf_dist_atr считает
+    # вызывающий код по закрытым свечам HTF; None - фильтр
+    # пропускается (диагностические вызовы).
+    if ENABLE_HTF_DIST_FILTER and htf_dist_atr is not None:
+        aligned_dist = htf_dist_atr if direction == "LONG" else -htf_dist_atr
+        metrics["htf_dist_atr"] = round(float(aligned_dist), 3)
+        if aligned_dist < HTF_DIST_MIN_ATR or aligned_dist > HTF_DIST_MAX_ATR:
+            reasons.append(
+                f"HTF distance {aligned_dist:.2f} ATR outside entry window "
+                f"[{HTF_DIST_MIN_ATR}, {HTF_DIST_MAX_ATR}]"
+            )
+
+    # --------------------------------------------------------
+    # MARKET REGIME
+    # --------------------------------------------------------
+    # Лонг - только когда бенчмарк в восходящем режиме (выше
+    # своей EMA), шорт - только в нисходящем. regime_uptrend
+    # считает вызывающий код по закрытым свечам бенчмарка;
+    # None - фильтр пропускается.
+    if ENABLE_REGIME_FILTER and regime_uptrend is not None:
+        metrics["regime_uptrend"] = bool(regime_uptrend)
+        if direction == "LONG" and not regime_uptrend:
+            reasons.append(
+                "Market regime filter: benchmark below its EMA "
+                "(downtrend), long blocked"
+            )
+        if direction == "SHORT" and regime_uptrend:
+            reasons.append(
+                "Market regime filter: benchmark above its EMA "
+                "(uptrend), short blocked"
             )
 
     if entry_price is None:

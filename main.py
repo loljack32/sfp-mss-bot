@@ -27,6 +27,10 @@ from config import (
     SIGNAL_COOLDOWN_MINUTES,
     SIGNAL_DEDUPE_RETENTION_DAYS,
     ENABLE_COUNTER_TREND_SIGNALS,
+    ENABLE_REGIME_FILTER,
+    REGIME_SYMBOL,
+    REGIME_TIMEFRAME,
+    REGIME_EMA_PERIOD,
 )
 
 from core.okx import OKXClient, OKXError, normalize_instrument_id
@@ -34,7 +38,11 @@ from core.structure import analyze_structure
 from core.sfp import find_sfps, is_sfp_invalidated
 from core.mss import find_latest_mss, is_mss_invalidated
 from core.signals import generate_signal, get_signal_failure_reasons
-from core.filters import evaluate_setup
+from core.filters import (
+    evaluate_setup,
+    compute_htf_ema_dist_atr,
+    compute_regime_uptrend,
+)
 from core.telegram import TelegramNotifier
 
 
@@ -210,6 +218,24 @@ def run_scanner() -> None:
         stats["total_scanned"] = total
         print(f"Scanning {total} liquid symbols from OKX...")
 
+        # Режим широкого рынка - один раз на весь скан: бенчмарк
+        # выше/ниже своей EMA. None - режим неизвестен, фильтр
+        # в evaluate_setup пропускается.
+        regime_uptrend = None
+        if ENABLE_REGIME_FILTER:
+            try:
+                df_regime = client.get_candles(
+                    symbol=normalize_instrument_id(REGIME_SYMBOL),
+                    timeframe=REGIME_TIMEFRAME,
+                    limit=max(REGIME_EMA_PERIOD + 50, CANDLE_LIMIT),
+                    closed_only=True,
+                )
+                regime_uptrend = compute_regime_uptrend(
+                    df_regime, REGIME_EMA_PERIOD
+                )
+            except (OKXError, Exception):
+                regime_uptrend = None
+
         for symbol in symbols_to_scan:
             try:
                 time.sleep(0.04)  # Минимальная пауза для защиты от rate-limit OKX
@@ -233,6 +259,7 @@ def run_scanner() -> None:
             # Анализ структуры
             _, htf_state = analyze_structure(df_htf, htf=True)
             structure_ltf, _ = analyze_structure(df_ltf, htf=False)
+            htf_dist = compute_htf_ema_dist_atr(df_htf)
 
             if htf_state.trend not in {"BULLISH", "BEARISH"}:
                 stats["skipped_htf"] += 1
@@ -274,6 +301,8 @@ def run_scanner() -> None:
                 balance=account_balance,
                 risk_percent=risk_percent,
                 leverage=leverage,
+                htf_dist_atr=htf_dist,
+                regime_uptrend=regime_uptrend,
             )
 
             if signal is None:

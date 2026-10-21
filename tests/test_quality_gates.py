@@ -311,16 +311,18 @@ class TestRiskGuards(unittest.TestCase):
         )
         self.assertIsNotNone(signal)
 
-    def test_tp2_capped_at_nearest_liquidity(self):
-        # Ликвидность на 2.5R: TP2 должен встать на неё, а не на 3R.
+    def test_tp2_uses_2r_multiple(self):
+        # Цели v2: TP1 = 1R, TP2 = 2R. Ликвидность на 2.5R -
+        # TP2 встаёт на 2R, не дотягиваясь до пула.
         df = make_df(liquidity_price=102.625)
         kwargs = self._kwargs(df)
 
         signal = generate_signal(risk_percent=1.0, leverage=10, **kwargs)
 
         self.assertIsNotNone(signal)
-        self.assertAlmostEqual(signal.tp2, 102.625, places=6)
-        self.assertAlmostEqual(signal.rr_tp2, 2.5, places=2)
+        self.assertAlmostEqual(signal.rr_tp1, 1.0, places=2)
+        self.assertAlmostEqual(signal.rr_tp2, 2.0, places=2)
+        self.assertAlmostEqual(signal.tp2, 102.10, places=2)
 
 
 class TestDedupeAndInstruments(unittest.TestCase):
@@ -390,7 +392,7 @@ class TestSituationalFilters(unittest.TestCase):
             msg=f"reasons: {result.reasons}",
         )
 
-    def test_short_rejected_when_disabled(self):
+    def _evaluate_short(self, regime_uptrend):
         df = make_df()
         break_index = len(df) - 2
         df.loc[break_index, "volume"] = 2000.0
@@ -404,7 +406,7 @@ class TestSituationalFilters(unittest.TestCase):
             )
         ]
 
-        result = evaluate_setup(
+        return evaluate_setup(
             df=df,
             sfp=make_sfp(
                 df,
@@ -424,13 +426,96 @@ class TestSituationalFilters(unittest.TestCase):
             ),
             structure=structure,
             htf_state=make_htf_state(),
+            regime_uptrend=regime_uptrend,
         )
 
-        self.assertFalse(result.passed)
-        self.assertTrue(
+    def test_short_not_blocked_by_direction_gate(self):
+        # Шорты разрешены конфигом: блокировать их может режим
+        # рынка или другие гейты, но не сам факт направления.
+        result = self._evaluate_short(regime_uptrend=False)
+        self.assertFalse(
             any("Short signals disabled" in r for r in result.reasons),
             msg=f"reasons: {result.reasons}",
         )
+
+    def test_short_blocked_in_uptrend_regime(self):
+        result = self._evaluate_short(regime_uptrend=True)
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("Market regime" in r for r in result.reasons),
+            msg=f"reasons: {result.reasons}",
+        )
+
+
+class TestHtfDistanceWindow(unittest.TestCase):
+    """Окно дистанции до EMA50 на 4H: [-0.5, +1.5] ATR."""
+
+    def _evaluate(self, dist):
+        df = make_df(liquidity_price=130.0)
+        break_index = len(df) - 2
+        df.loc[break_index, "volume"] = 2000.0
+        return evaluate_setup(
+            df=df,
+            sfp=make_sfp(df, break_index - 5),
+            mss=make_mss(df, break_index),
+            structure=far_liquidity_structure(df),
+            htf_state=make_htf_state(),
+            htf_dist_atr=dist,
+        )
+
+    def test_inside_window_passes(self):
+        result = self._evaluate(0.7)
+        self.assertTrue(result.passed, msg=f"reasons: {result.reasons}")
+
+    def test_overheated_htf_rejected(self):
+        result = self._evaluate(2.8)
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("HTF distance" in r for r in result.reasons),
+            msg=f"reasons: {result.reasons}",
+        )
+
+    def test_deep_countertrend_rejected(self):
+        result = self._evaluate(-1.9)
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("HTF distance" in r for r in result.reasons),
+            msg=f"reasons: {result.reasons}",
+        )
+
+
+class TestRegimeFilter(unittest.TestCase):
+    """Фильтр режима рынка: лонг только при бенчмарке выше EMA."""
+
+    def _evaluate(self, uptrend):
+        df = make_df(liquidity_price=130.0)
+        break_index = len(df) - 2
+        df.loc[break_index, "volume"] = 2000.0
+        return evaluate_setup(
+            df=df,
+            sfp=make_sfp(df, break_index - 5),
+            mss=make_mss(df, break_index),
+            structure=far_liquidity_structure(df),
+            htf_state=make_htf_state(),
+            htf_dist_atr=0.7,
+            regime_uptrend=uptrend,
+        )
+
+    def test_uptrend_passes(self):
+        result = self._evaluate(True)
+        self.assertTrue(result.passed, msg=f"reasons: {result.reasons}")
+
+    def test_downtrend_blocks_long(self):
+        result = self._evaluate(False)
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("Market regime" in r for r in result.reasons),
+            msg=f"reasons: {result.reasons}",
+        )
+
+    def test_unknown_regime_passes(self):
+        result = self._evaluate(None)
+        self.assertTrue(result.passed, msg=f"reasons: {result.reasons}")
 
 
 class TestBreakevenOutcome(unittest.TestCase):

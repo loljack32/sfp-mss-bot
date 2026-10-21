@@ -17,6 +17,8 @@ from config import (
     MAX_RISK_PERCENT,
     TP1_R_MULTIPLE,
     TP2_R_MULTIPLE,
+    MIN_TP1_R_MULTIPLE,
+    MIN_TP2_R_MULTIPLE,
     ENABLE_COUNTER_TREND_SIGNALS,
     ENABLE_BREAKEVEN,
     BREAKEVEN_TRIGGER_R,
@@ -148,6 +150,8 @@ def build_signal(
     leverage: int = DEFAULT_LEVERAGE,
     entry_price: Optional[float] = None,
     allow_counter_trend: bool = ENABLE_COUNTER_TREND_SIGNALS,
+    htf_dist_atr: Optional[float] = None,
+    regime_uptrend: Optional[bool] = None,
     *args,
     **kwargs,
 ) -> TradingSignal:
@@ -169,6 +173,8 @@ def build_signal(
         htf_state=htf_state,
         entry_price=entry_price,
         allow_counter_trend=allow_counter_trend,
+        htf_dist_atr=htf_dist_atr,
+        regime_uptrend=regime_uptrend,
     )
 
     if not filter_result.passed:
@@ -210,16 +216,15 @@ def build_signal(
         tp2_rr=tp2_multiple,
     )
 
-    # Жёсткие минимальные требования к RR.
-    # TP1 должен быть минимум 1.5R, TP2 минимум 2.0R.
-    if risk.rr_tp1 < 1.50:
+    # Жёсткие минимальные требования к RR (пороги - в config.py).
+    if risk.rr_tp1 < MIN_TP1_R_MULTIPLE:
         raise ValueError(
-            f"TP1 RR {risk.rr_tp1:.2f} is below minimum 1.50R."
+            f"TP1 RR {risk.rr_tp1:.2f} is below minimum {MIN_TP1_R_MULTIPLE:.2f}R."
         )
 
-    if risk.rr_tp2 < 2.00:
+    if risk.rr_tp2 < MIN_TP2_R_MULTIPLE:
         raise ValueError(
-            f"TP2 RR {risk.rr_tp2:.2f} is below minimum 2.00R."
+            f"TP2 RR {risk.rr_tp2:.2f} is below minimum {MIN_TP2_R_MULTIPLE:.2f}R."
         )
 
     validate_position_notional(
@@ -322,6 +327,8 @@ def generate_signal(
     leverage: int = DEFAULT_LEVERAGE,
     entry_price: Optional[float] = None,
     allow_counter_trend: bool = ENABLE_COUNTER_TREND_SIGNALS,
+    htf_dist_atr: Optional[float] = None,
+    regime_uptrend: Optional[bool] = None,
     *args,
     **kwargs,
 ) -> Optional[TradingSignal]:
@@ -342,6 +349,8 @@ def generate_signal(
             leverage=leverage,
             entry_price=entry_price,
             allow_counter_trend=allow_counter_trend,
+            htf_dist_atr=htf_dist_atr,
+            regime_uptrend=regime_uptrend,
         )
     except ValueError:
         return None

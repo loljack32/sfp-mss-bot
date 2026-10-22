@@ -51,6 +51,7 @@ from core.telegram import TelegramNotifier
 # ============================================================
 
 USER_SETTINGS_FILE = "data/user_settings.json"
+FORWARD_JOURNAL_FILE = "data/forward_journal.jsonl"
 
 
 def load_user_settings(filepath: str = USER_SETTINGS_FILE) -> Tuple[float, float, int]:
@@ -93,6 +94,38 @@ def save_signal_state(state: Dict[str, str], filepath: str = SIGNAL_STATE_FILE) 
             json.dump(state, f, indent=2, ensure_ascii=False)
     except Exception as exc:
         print(f"[ERROR] Failed to save state file: {exc}")
+
+
+def append_forward_journal(signal, filepath: str = FORWARD_JOURNAL_FILE) -> None:
+    """
+    Дописывает отправленный сигнал в журнал форвард-теста.
+
+    Журнал - единственный источник точных цен живых сигналов:
+    по нему forward_eval.py считает исходы на невиданных данных
+    по тем же правилам выхода, что и backtest.py. Ошибка записи
+    никогда не должна ронять сканер, поэтому все исключения глушатся.
+    """
+    try:
+        record = {
+            "ts_utc": datetime.now(timezone.utc).isoformat(),
+            "symbol": signal.symbol,
+            "direction": signal.direction,
+            "timeframe": signal.timeframe,
+            "setup_type": getattr(signal, "setup_type", "TREND"),
+            "entry": float(signal.entry),
+            "stop_loss": float(signal.stop_loss),
+            "tp1": float(signal.tp1),
+            "tp2": float(signal.tp2),
+            "rr_tp1": float(signal.rr_tp1),
+            "rr_tp2": float(signal.rr_tp2),
+            "signal_score": float(signal.signal_score),
+        }
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[ERROR] Failed to append forward journal: {exc}")
 
 
 def setup_fingerprint(symbol: str, sfp, mss) -> str:
@@ -469,6 +502,7 @@ def run_scanner() -> None:
                         sfp=signal.sfp,
                         mss=signal.mss,
                     )
+                    append_forward_journal(signal)
                     stats["signals_sent"] += 1
                 else:
                     print(f"[{signal.symbol}] -> Failed to send Telegram message.")
@@ -480,6 +514,7 @@ def run_scanner() -> None:
                     sfp=signal.sfp,
                     mss=signal.mss,
                 )
+                append_forward_journal(signal)
 
     save_signal_state(prune_signal_state(state))
 

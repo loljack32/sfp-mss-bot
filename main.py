@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -126,6 +127,43 @@ def append_forward_journal(signal, filepath: str = FORWARD_JOURNAL_FILE) -> None
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
         print(f"[ERROR] Failed to append forward journal: {exc}")
+
+
+def commit_forward_journal() -> None:
+    """
+    В GitHub Actions коммитит журнал форвард-теста в репозиторий.
+
+    Шаг workflow коммитит только data/signals_state.json, а файл
+    workflow через интеграцию не обновить (нет права workflows),
+    поэтому сканер пушит журнал сам токеном раннера. Вне Actions
+    (локальные запуски) ничего не делает. Ошибки только логируются:
+    сбой коммита журнала не должен ронять скан.
+    """
+    if os.getenv("GITHUB_ACTIONS") != "true":
+        return
+    try:
+        def git(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", *args], capture_output=True, text=True, timeout=60
+            )
+
+        git("config", "user.name", "github-actions[bot]")
+        git("config", "user.email", "github-actions[bot]@users.noreply.github.com")
+        git("add", FORWARD_JOURNAL_FILE)
+        staged = git("diff", "--staged", "--quiet")
+        if staged.returncode == 0:
+            return
+        commit = git("commit", "-m", "chore: forward journal [skip ci]")
+        if commit.returncode != 0:
+            print(f"[ERROR] Forward journal commit failed: {commit.stderr.strip()}")
+            return
+        push = git("push")
+        if push.returncode != 0:
+            # Не страшно: последующий шаг workflow все равно запушит
+            # все локальные коммиты вместе со стейтом.
+            print(f"[WARN] Forward journal push deferred: {push.stderr.strip()}")
+    except Exception as exc:
+        print(f"[ERROR] Forward journal commit error: {exc}")
 
 
 def setup_fingerprint(symbol: str, sfp, mss) -> str:
@@ -517,6 +555,7 @@ def run_scanner() -> None:
                 append_forward_journal(signal)
 
     save_signal_state(prune_signal_state(state))
+    commit_forward_journal()
 
     print("\n" + "=" * 65)
     print("SCAN DIAGNOSTICS")
